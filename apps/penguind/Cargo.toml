@@ -1,5 +1,6 @@
 [package]
 name = "penguind"
+default-run = "penguind"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
