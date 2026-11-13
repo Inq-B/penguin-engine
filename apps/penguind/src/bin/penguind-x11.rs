@@ -9,7 +9,7 @@ mod state;
 mod preset;
 
 use std::collections::BTreeMap;
-use std::ffi::{c_char, c_int, c_long, c_ulong, c_void};
+use std::ffi::{c_char, c_int, c_ulong, c_void};
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -21,9 +21,9 @@ use clap::Parser;
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, XlibDisplayHandle, XlibWindowHandle,
 };
-use wpe_ipc::{Fill, Request, Response, Settings, Status, OutputStatus, WallpaperInfo, Values};
+use wpe_ipc::{Fill, Request, Response, Settings, Status, OutputStatus, WallpaperInfo};
 use wpe_render::{Gpu, wgpu};
-use wpe_runtime::{Wallpaper, FillMode, MouseButton};
+use wpe_runtime::{Wallpaper, FillMode};
 
 #[link(name = "X11")]
 unsafe extern "C" {
@@ -65,6 +65,10 @@ struct Args {
     #[arg(long)] audio: bool,
     #[arg(long)] fill: Option<Fill>,
     #[arg(long)] passthrough: bool,
+    /// Allow wallpaper input (X11 defaults to click-through for desktop icons).
+    #[arg(long)] interactive: bool,
+    /// Accepted for compatibility; X11 uses EWMH desktop windows.
+    #[arg(long)] layer: Option<wpe_ipc::Layer>,
     #[arg(long)] socket: Option<PathBuf>,
     #[arg(long)] stats: bool,
     #[arg(long = "property", value_parser = parse_property)]
@@ -503,7 +507,10 @@ fn main()->Result<()> {
     if let Some(v)=args.volume {settings.volume=v;}
     if args.audio {settings.audio=true;}
     if let Some(v)=args.fill {settings.fill=v;}
-    if args.passthrough {settings.passthrough=true;}
+    // X11 desktop backgrounds must leave desktop icons and context menus clickable.
+    // --interactive deliberately opts out (e.g. for mouse-reactive wallpapers).
+    settings.passthrough = !args.interactive;
+    if args.passthrough { settings.passthrough=true; }
     if let Some(wallpaper)=&args.wallpaper {
         let resolved=wpe_runtime::steam::resolve_wallpaper(wallpaper).map_err(anyhow::Error::msg)?;
         let mut entry=state::SavedOutput::new(resolved);
