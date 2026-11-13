@@ -104,7 +104,7 @@ GLSL/HLSL dialect to SPIR-V and run through wgpu:
 
 `penguind` plays them as the desktop background on Wayland (wlr-layer-shell), controlled at
 runtime over a Unix socket (`penguinctl`, the `penguin-engine` app) and run as a systemd user
-service. Not yet: playlists and X11 desktops.
+service. Not yet: playlists. An experimental native X11 backend is documented in [docs/X11.md](docs/X11.md).
 
 Debugging aids: `WPE_SCRIPT_AUDIT=<file>` records script requests the runtime doesn't
 handle, `WPE_FAKE_AUDIO=1` feeds a synthetic spectrum, `scene-viewer --frames N` runs N
@@ -165,7 +165,7 @@ from this machine or the local network (localhost, private and link-local addres
 resolving to them); `WPE_WEB_ALLOW_HOSTS=nas.lan,192.168.1.10` lets chosen hosts through.
 Navigating away from the wallpaper and popups are blocked.
 
-## Desktop wallpaper (Wayland)
+## Desktop wallpaper (Wayland and experimental X11)
 
 ```sh
 cargo run --release -p penguind -- ~/.local/share/Steam/steamapps/workshop/content/431960/<id>
@@ -344,7 +344,7 @@ Both are part of `graphical-session.target`, which KDE Plasma, GNOME and systemd
 sway/Hyprland sessions start.
 
 ```sh
-cargo install --path apps/penguind && cargo install --path apps/penguinctl
+cargo install --path apps/penguind --bins && cargo install --path apps/penguinctl
 penguind 3566329932    # once, to pick a wallpaper (Ctrl-C), or later: penguinctl set ...
 systemctl --user link $PWD/systemd/penguin-engine.socket $PWD/systemd/penguin-engine.service
 systemctl --user enable --now penguin-engine.socket penguin-engine.service
