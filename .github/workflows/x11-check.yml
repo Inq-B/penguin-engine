@@ -1,0 +1,13 @@
+name: X11 backend check
+on:
+  push:
+    branches: [feat/x11-backend]
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libx11-dev libxext-dev libwayland-dev libpulse-dev libasound2-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libclang-dev pkg-config cmake nasm
+      - run: cargo check --locked -p penguind --no-default-features --bins
