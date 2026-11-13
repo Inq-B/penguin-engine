@@ -875,6 +875,19 @@ fn signal_pipe(signals: &[i32]) -> Result<UnixStream> {
 }
 
 fn main() -> Result<()> {
+    // Keep one public daemon entry point: use the native X11 backend when
+    // this is an X11 session, while retaining the existing Wayland path.
+    if std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("x11") {
+        let binary = std::env::current_exe()?.with_file_name("penguind-x11");
+        let status = std::process::Command::new(&binary)
+            .args(std::env::args_os().skip(1))
+            .status()
+            .with_context(|| format!("cannot run {}; install both penguind binaries", binary.display()))?;
+        if !status.success() {
+            anyhow::bail!("X11 daemon exited with {status}");
+        }
+        return Ok(());
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
