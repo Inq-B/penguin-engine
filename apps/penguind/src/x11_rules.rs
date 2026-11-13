@@ -1,5 +1,5 @@
 //! Shared rule matching logic adapted from the Wayland daemon's rules.rs.
-use wpe_ipc::{Condition, Limits, Playback, Rule, Signals, WindowInfo, WindowState};
+use wpe_ipc::{Condition, Limits, Rule, Signals, WindowInfo, WindowState};
 
 /// What the enabled `rules` holding make of the wallpaper on `output`.
 pub fn limits_for(rules: &[Rule], signals: &Signals, output: &str) -> Limits {
