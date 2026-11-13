@@ -7,6 +7,12 @@
 mod state;
 #[path = "../preset.rs"]
 mod preset;
+#[path = "../power.rs"]
+mod power;
+#[path = "../x11_windows.rs"]
+mod x11_windows;
+#[path = "../x11_rules.rs"]
+mod x11_rules;
 
 use std::collections::BTreeMap;
 use std::ffi::{c_char, c_int, c_ulong, c_void};
@@ -180,6 +186,8 @@ struct Screen {
     path: Option<PathBuf>,
     item: Option<preset::Item>,
     paused: bool,
+    held: wpe_ipc::Limits,
+    last_render: Instant,
     fill: Fill,
     frames: u32,
     fps: f32,
@@ -187,7 +195,9 @@ struct Screen {
 }
 impl Screen {
     fn render(&mut self, gpu: &Gpu, fps_cap: u32, stats: bool) {
-        if self.paused { return; }
+        if self.paused || self.held.playback >= wpe_ipc::Playback::Pause { return; }
+        let cap = self.held.fps.map_or(fps_cap, |rule| if fps_cap == 0 { rule } else { rule.min(fps_cap) }).max(1);
+        if self.last_render.elapsed() < Duration::from_secs_f64(1.0 / cap as f64) { return; }
         let Some(wallpaper) = self.wallpaper.as_mut() else { return; };
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) |
@@ -203,6 +213,7 @@ impl Screen {
         wallpaper.render(gpu, &mut encoder, &view, (self.config.width,self.config.height));
         gpu.queue.submit([encoder.finish()]);
         gpu.queue.present(frame);
+        self.last_render = Instant::now();
         self.frames += 1;
         let elapsed = self.sampled.elapsed();
         if elapsed >= Duration::from_secs(3) {
@@ -222,6 +233,7 @@ struct App {
     state: state::State,
     state_path: Option<PathBuf>,
     settings: Settings,
+    signals: wpe_ipc::Signals,
     peers: Vec<Peer>,
     subscribers: Vec<UnixStream>,
     quit: bool,
@@ -250,8 +262,36 @@ impl App {
         Status { settings: self.settings.clone(), outputs: self.screens.iter().map(|s| OutputStatus {
             name: s.monitor.name.clone(), width: s.monitor.width, height: s.monitor.height,
             scale: 1.0, wallpaper: self.wallpaper_info(s), paused: s.paused, fps: s.fps,
-            fill: s.fill, ..Default::default()
+            fill: s.fill, limits: s.held.clone(), ..Default::default()
         }).collect() }
+    }
+    fn poll_signals(&mut self) {
+        let root = unsafe { XRootWindow(self.display.0, self.display.1) };
+        let rects = self.screens.iter().map(|s| (
+            s.monitor.name.clone(),
+            (s.monitor.x, s.monitor.y, s.monitor.width, s.monitor.height)
+        )).collect::<Vec<_>>();
+        self.signals.windows = Some(x11_windows::list(self.display.0, root, &rects));
+        self.signals.battery = power::battery();
+        // Idle/audio sources have not yet been wired up on this backend.
+        self.apply_rules();
+    }
+    fn apply_rules(&mut self) {
+        for s in &mut self.screens {
+            let limits = x11_rules::limits_for(&self.settings.rules, &self.signals, &s.monitor.name);
+            if s.held == limits { continue; }
+            tracing::info!("{}: X11 rules {:?} ({})", s.monitor.name, limits.playback, limits.because.join(", "));
+            s.held = limits;
+            if let Some(w) = &mut s.wallpaper {
+                w.set_paused(s.paused || s.held.playback >= wpe_ipc::Playback::Pause);
+                let volume = s.path.as_ref().map_or(100, |p| self.state.volume(&s.monitor.name, p));
+                let muted = s.held.playback >= wpe_ipc::Playback::Mute;
+                w.set_volume(if muted {0.0} else {self.settings.volume as f32 / 100.0 * volume as f32 / 100.0});
+                let particles = s.held.particles.unwrap_or(100).min(100);
+                w.set_particle_density((self.settings.particles.min(100) as f32 / 100.0) * particles as f32 / 100.0);
+            }
+        }
+        self.publish();
     }
     fn publish(&mut self) {
         let json = serde_json::to_vec(&wpe_ipc::Event::Status { status: self.status() }).unwrap_or_default();
@@ -279,6 +319,7 @@ impl App {
         s.path = Some(path);
         s.item = Some(item);
         s.paused = false;
+        s.held = wpe_ipc::Limits::default();
         Ok(())
     }
     fn settings_update(&mut self, settings: Settings) {
@@ -296,6 +337,7 @@ impl App {
         }
         self.state.settings = Some(self.settings.clone());
         self.save();
+        self.apply_rules();
     }
     fn handle(&mut self, request: Request) -> Response {
         let answer = (|| -> std::result::Result<Response,String> {
@@ -407,7 +449,7 @@ impl App {
                     }
                     Ok(Response{properties:Some(properties),..Response::ok()})
                 },
-                Request::Signals => Err("X11 signals are not implemented yet".into()),
+                Request::Signals => Ok(Response {signals:Some(self.signals.clone()),..Response::ok()}),
                 Request::Subscribe => Err("subscribe dispatched by socket layer".into()),
             }
         })();
@@ -489,7 +531,8 @@ fn create_screen(display:&Display,instance:&wgpu::Instance,gpu:Option<&Gpu>,m:Mo
     surface.configure(&gpu.device,&config);
     Ok((Screen {
         monitor:m,win,surface,config,wallpaper:None,path:None,item:None,
-        paused:false,fill:Fill::Auto,frames:0,fps:0.0,sampled:Instant::now(),
+        paused:false,held:wpe_ipc::Limits::default(),last_render:Instant::now()-Duration::from_secs(1),
+        fill:Fill::Auto,frames:0,fps:0.0,sampled:Instant::now(),
     },new_gpu))
 }
 fn main()->Result<()> {
@@ -531,7 +574,8 @@ fn main()->Result<()> {
         screens.push(screen);
     }
     let mut app=App{display,gpu:gpu.context("no selected X11 output")?,screens,assets,
-        state:saved,state_path:path,settings,peers:vec![],subscribers:vec![],quit:false};
+        state:saved,state_path:path,settings,signals:wpe_ipc::Signals::default(),
+        peers:vec![],subscribers:vec![],quit:false};
     for i in 0..app.screens.len() {
         let name=app.screens[i].monitor.name.clone();
         if let Some(saved)=app.state.for_output(&name).cloned() {
@@ -539,6 +583,7 @@ fn main()->Result<()> {
             if let Err(e)=app.load(i,saved.wallpaper,saved.properties){tracing::error!("{name}: {e:#}");}
         }
     }
+    app.poll_signals();
     let socket_path=args.socket.or_else(wpe_ipc::socket_path)
         .context("no socket path; set XDG_RUNTIME_DIR or --socket")?;
     if socket_path.exists() {
@@ -548,6 +593,7 @@ fn main()->Result<()> {
     let listener=UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
     let mut last_scan=Instant::now();
+    let mut last_signals=Instant::now();
     let mut next_frame=Instant::now();
     tracing::info!("X11 backend active on {} outputs; control socket {}",app.screens.len(),socket_path.display());
     while !app.quit {
@@ -562,6 +608,10 @@ fn main()->Result<()> {
             }
         }
         app.poll_peers();
+        if last_signals.elapsed()>=Duration::from_millis(500) {
+            app.poll_signals();
+            last_signals=Instant::now();
+        }
         if last_scan.elapsed()>=Duration::from_secs(2) {
             if let Ok(found)=monitors() {
                 for m in &found {
