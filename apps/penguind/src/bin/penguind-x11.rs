@@ -13,6 +13,8 @@ mod power;
 mod x11_windows;
 #[path = "../x11_rules.rs"]
 mod x11_rules;
+#[path = "../x11_sound_watch.rs"]
+mod x11_sound_watch;
 
 use std::collections::BTreeMap;
 use std::ffi::{c_char, c_int, c_ulong, c_void};
@@ -246,6 +248,7 @@ struct App {
     state_path: Option<PathBuf>,
     settings: Settings,
     signals: wpe_ipc::Signals,
+    sound_rx: std::sync::mpsc::Receiver<Option<Vec<String>>>,
     peers: Vec<Peer>,
     subscribers: Vec<UnixStream>,
     quit: bool,
@@ -308,7 +311,8 @@ impl App {
         )).collect::<Vec<_>>();
         self.signals.windows = Some(x11_windows::list(self.display.0, root, &rects));
         self.signals.battery = power::battery();
-        // Idle/audio sources have not yet been wired up on this backend.
+        while let Ok(sound) = self.sound_rx.try_recv() { self.signals.audio = sound; }
+        // X11 idle notification has not yet been wired up.
         self.apply_rules();
     }
     fn apply_rules(&mut self) {
@@ -608,8 +612,10 @@ fn main()->Result<()> {
         if let Some(g)=new_gpu{gpu=Some(g);}
         screens.push(screen);
     }
+    let (sound_tx,sound_rx)=std::sync::mpsc::channel();
+    x11_sound_watch::watch(sound_tx);
     let mut app=App{display,gpu:gpu.context("no selected X11 output")?,screens,assets,
-        state:saved,state_path:path,settings,signals:wpe_ipc::Signals::default(),
+        state:saved,state_path:path,settings,signals:wpe_ipc::Signals::default(),sound_rx,
         peers:vec![],subscribers:vec![],quit:false};
     for i in 0..app.screens.len() {
         let name=app.screens[i].monitor.name.clone();
