@@ -17,10 +17,10 @@ mod x11_rules;
 mod x11_sound_watch;
 
 use std::collections::BTreeMap;
-use std::ffi::{c_char, c_int, c_ulong, c_void};
+use std::ffi::{c_char, c_int, c_long, c_ulong, c_void};
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
