@@ -29,7 +29,7 @@ use raw_window_handle::{
 };
 use wpe_ipc::{Fill, Request, Response, Settings, Status, OutputStatus, WallpaperInfo};
 use wpe_render::{Gpu, wgpu};
-use wpe_runtime::{Wallpaper, FillMode};
+use wpe_runtime::{Wallpaper, FillMode, MouseButton};
 
 #[link(name = "X11")]
 unsafe extern "C" {
@@ -49,6 +49,9 @@ unsafe extern "C" {
     fn XInternAtom(display: *mut c_void, name: *const c_char, only_if_exists: c_int) -> c_ulong;
     fn XChangeProperty(display: *mut c_void, window: c_ulong, property: c_ulong,
         typ: c_ulong, format: c_int, mode: c_int, data: *const u8, nelements: c_int) -> c_int;
+    fn XSelectInput(display: *mut c_void, window: c_ulong, mask: c_long) -> c_int;
+    fn XPending(display: *mut c_void) -> c_int;
+    fn XNextEvent(display: *mut c_void, event: *mut c_void) -> c_int;
     fn XQueryPointer(display: *mut c_void, window: c_ulong, root: *mut c_ulong,
         child: *mut c_ulong, root_x: *mut c_int, root_y: *mut c_int,
         win_x: *mut c_int, win_y: *mut c_int, mask: *mut u32) -> c_int;
@@ -119,6 +122,14 @@ fn monitors() -> Result<Vec<Monitor>> {
     }
     Ok(result_monitors)
 }
+// Xlib's common button event prefix. The XEvent union is at least 24 longs.
+#[repr(C)]
+struct XButtonEvent {
+    event_type: c_int, serial: c_ulong, send_event: c_int,
+    display: *mut c_void, window: c_ulong, root: c_ulong, subwindow: c_ulong,
+    time: c_ulong, x: c_int, y: c_int, x_root: c_int, y_root: c_int,
+    state: u32, button: u32, same_screen: c_int,
+}
 struct Display(*mut c_void, c_int);
 impl Display {
     fn open() -> Result<Self> {
@@ -149,6 +160,7 @@ impl Display {
             let skip = self.atom(b"_NET_WM_STATE_SKIP_TASKBAR\0");
             let values = [below, skip];
             XChangeProperty(self.0, win, state, atom, 32, 0, values.as_ptr().cast(), 2);
+            XSelectInput(self.0, win, (1 << 2) | (1 << 3) | (1 << 6));
             self.passthrough(win, passthrough);
             XMapWindow(self.0, win);
             XLowerWindow(self.0, win);
@@ -264,6 +276,29 @@ impl App {
             scale: 1.0, wallpaper: self.wallpaper_info(s), paused: s.paused, fps: s.fps,
             fill: s.fill, limits: s.held.clone(), ..Default::default()
         }).collect() }
+    }
+    fn poll_input(&mut self) {
+        unsafe {
+            while XPending(self.display.0) > 0 {
+                let mut raw = [0 as c_long; 24];
+                XNextEvent(self.display.0, raw.as_mut_ptr().cast());
+                let event = &*(raw.as_ptr().cast::<XButtonEvent>());
+                if event.event_type != 4 && event.event_type != 5 {continue;}
+                let Some(screen) = self.screens.iter_mut().find(|s| s.win == event.window) else {continue;};
+                let Some(wallpaper) = screen.wallpaper.as_mut() else {continue;};
+                let down = event.event_type == 4;
+                match event.button {
+                    1 => wallpaper.pointer_button(MouseButton::Left, down),
+                    2 => wallpaper.pointer_button(MouseButton::Middle, down),
+                    3 => wallpaper.pointer_button(MouseButton::Right, down),
+                    4 if down => wallpaper.scroll(0.0, -120.0),
+                    5 if down => wallpaper.scroll(0.0, 120.0),
+                    6 if down => wallpaper.scroll(-120.0, 0.0),
+                    7 if down => wallpaper.scroll(120.0, 0.0),
+                    _ => {}
+                }
+            }
+        }
     }
     fn poll_signals(&mut self) {
         let root = unsafe { XRootWindow(self.display.0, self.display.1) };
@@ -608,6 +643,7 @@ fn main()->Result<()> {
             }
         }
         app.poll_peers();
+        app.poll_input();
         if last_signals.elapsed()>=Duration::from_millis(500) {
             app.poll_signals();
             last_signals=Instant::now();
