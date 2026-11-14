@@ -76,6 +76,7 @@ function Setting({ label, hint, children }: { label: string; hint?: string; chil
 }
 
 function General({ settings }: { settings?: DaemonSettings }) {
+  const x11 = useApp((s) => s.daemonFeatures.includes("x11"));
   const [autostart, setAutostart] = useState<boolean | null>(null);
   useEffect(() => {
     api.autostart().then(setAutostart, () => setAutostart(null));
@@ -95,9 +96,30 @@ function General({ settings }: { settings?: DaemonSettings }) {
       </Setting>
       {settings && (
         <>
-          <Setting label="Let clicks through" hint="Clicks reach the desktop instead of the wallpaper">
-            <Toggle on={settings.passthrough} onChange={(passthrough) => patch({ passthrough })} />
-          </Setting>
+          {x11 ? (
+            <>
+              <Setting
+                label="Interactive wallpaper clicks"
+                hint="Enable mouse buttons for clickable scene and web wallpapers. Off means clicks go only to your desktop; hover effects still work."
+              >
+                <Toggle
+                  on={!settings.passthrough}
+                  onChange={(enabled) => patch({ passthrough: !enabled })}
+                />
+              </Setting>
+              {!settings.passthrough && (
+                <div class="hint" style={{ lineHeight: 1.6, marginBottom: 8 }}>
+                  Cinnamon's desktop icons may also receive a click while the
+                  wallpaper is interactive. Disable this toggle whenever you
+                  want normal desktop-only interactions.
+                </div>
+              )}
+            </>
+          ) : (
+            <Setting label="Let clicks through" hint="Clicks reach the desktop instead of the wallpaper">
+              <Toggle on={settings.passthrough} onChange={(passthrough) => patch({ passthrough })} />
+            </Setting>
+          )}
           <div class="setting-col">
             <div>Layer</div>
             <Segments

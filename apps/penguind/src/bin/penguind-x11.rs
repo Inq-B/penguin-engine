@@ -63,6 +63,8 @@ unsafe extern "C" {
     fn XShapeCombineRectangles(display: *mut c_void, window: c_ulong,
         kind: c_int, x: c_int, y: c_int, rectangles: *const c_void,
         n_rectangles: c_int, op: c_int, ordering: c_int);
+    fn XShapeCombineMask(display: *mut c_void, window: c_ulong,
+        kind: c_int, x: c_int, y: c_int, bitmap: c_ulong, op: c_int);
 }
 
 #[derive(Parser)]
@@ -89,6 +91,17 @@ fn parse_property(s: &str) -> std::result::Result<(String, serde_json::Value), S
     let (k, v) = s.split_once('=').ok_or("expected NAME=VALUE")?;
     Ok((k.to_owned(), serde_json::from_str(v).unwrap_or_else(|_| v.into())))
 }
+/// Preserve the configured desktop input policy. The backend defaults to
+/// click-through only on first installation; a saved GUI preference must win
+/// on subsequent launches.
+fn x11_passthrough(
+    saved: Option<bool>, configured: Option<bool>, interactive: bool, passthrough: bool
+) -> bool {
+    if passthrough { true }
+    else if interactive { false }
+    else { saved.or(configured).unwrap_or(true) }
+}
+
 fn fill_mode(fill: Fill) -> FillMode {
     match fill {
         Fill::Auto => FillMode::Auto, Fill::Crop => FillMode::Crop,
@@ -195,11 +208,10 @@ impl Display {
             if yes {
                 XShapeCombineRectangles(self.0, win, 2, 0, 0, std::ptr::null(), 0, 0, 0);
             } else {
-                // Reset to default input region by copying the bounding shape.
-                // ShapeBounding = 0; ShapeInput = 2; ShapeSet = 0.
-                // For portability, interactive mode uses an explicit rectangle.
-                let rect: [u16; 4] = [0,0, u16::MAX,u16::MAX];
-                XShapeCombineRectangles(self.0, win, 2, 0, 0, rect.as_ptr().cast(), 1, 0, 0);
+                // Passing None to XShapeCombineMask removes the custom input
+                // region and restores the server's normal window-sized shape.
+                // The old fixed 65535px rectangle was not the correct reset.
+                XShapeCombineMask(self.0, win, 2, 0, 0, 0, 0);
             }
             XFlush(self.0);
         }
@@ -226,8 +238,32 @@ struct Screen {
     sampled: Instant,
     render_time: Duration,
     render_max: Duration,
+    pressed: u32,
 }
 impl Screen {
+    /// Keep the Xlib event path and the polled desktop fallback in sync, so
+    /// a click is never delivered twice and release events aren't lost.
+    fn button(&mut self, button: MouseButton, down: bool) {
+        let bit=match button {
+            MouseButton::Left => 1 << 8,     // X11 Button1Mask
+            MouseButton::Middle => 1 << 9,   // X11 Button2Mask
+            MouseButton::Right => 1 << 10,   // X11 Button3Mask
+        };
+        if (self.pressed & bit != 0)==down { return; }
+        if down { self.pressed |= bit; } else { self.pressed &= !bit; }
+        if let Some(wallpaper)=&mut self.wallpaper {
+            wallpaper.pointer_button(button,down);
+        }
+    }
+    fn buttons(&mut self, mask: u32) {
+        for (button,bit) in [
+            (MouseButton::Left,1 << 8),
+            (MouseButton::Middle,1 << 9),
+            (MouseButton::Right,1 << 10),
+        ] {
+            self.button(button,mask & bit != 0);
+        }
+    }
     fn render(&mut self, gpu: &Gpu, fps_cap: u32, stats: bool) {
         if self.paused || self.held.playback >= wpe_ipc::Playback::Pause { return; }
         // The X11 loop uses 60 Hz when the general cap is unspecified.
@@ -294,6 +330,8 @@ struct App {
     quit: bool,
     state_dirty: bool,
     last_state_edit: Instant,
+    hit_window: c_ulong,
+    hit_is_desktop: bool,
 }
 impl App {
     fn save(&self) {
@@ -322,6 +360,18 @@ impl App {
             fill: s.fill, limits: s.held.clone(), ..Default::default()
         }).collect() }
     }
+    /// XQueryPointer(root) reports the top-level window actually under the
+    /// cursor. Only relay buttons observed over desktop surfaces, never over
+    /// another application, even when those buttons were grabbed by Nemo.
+    fn desktop_hit(&mut self, child: c_ulong) -> bool {
+        if child == 0 || self.screens.iter().any(|s| s.win == child) { return true; }
+        if self.hit_window != child {
+            self.hit_window = child;
+            self.hit_is_desktop = x11_windows::is_desktop(self.display.0,child);
+        }
+        self.hit_is_desktop
+    }
+
     fn poll_input(&mut self) {
         unsafe {
             while XPending(self.display.0) > 0 {
@@ -329,17 +379,23 @@ impl App {
                 XNextEvent(self.display.0, raw.as_mut_ptr().cast());
                 let event = &*(raw.as_ptr().cast::<XButtonEvent>());
                 if event.event_type != 4 && event.event_type != 5 {continue;}
+                if self.settings.passthrough {continue;}
                 let Some(screen) = self.screens.iter_mut().find(|s| s.win == event.window) else {continue;};
-                let Some(wallpaper) = screen.wallpaper.as_mut() else {continue;};
+                if let Some(wallpaper)=screen.wallpaper.as_mut() {
+                    wallpaper.set_pointer(glam::Vec2::new(
+                        (event.x as f32 / screen.monitor.width.max(1) as f32).clamp(0.0,1.0),
+                        (event.y as f32 / screen.monitor.height.max(1) as f32).clamp(0.0,1.0),
+                    ));
+                } else { continue; }
                 let down = event.event_type == 4;
                 match event.button {
-                    1 => wallpaper.pointer_button(MouseButton::Left, down),
-                    2 => wallpaper.pointer_button(MouseButton::Middle, down),
-                    3 => wallpaper.pointer_button(MouseButton::Right, down),
-                    4 if down => wallpaper.scroll(0.0, -120.0),
-                    5 if down => wallpaper.scroll(0.0, 120.0),
-                    6 if down => wallpaper.scroll(-120.0, 0.0),
-                    7 if down => wallpaper.scroll(120.0, 0.0),
+                    1 => screen.button(MouseButton::Left, down),
+                    2 => screen.button(MouseButton::Middle, down),
+                    3 => screen.button(MouseButton::Right, down),
+                    4 if down => if let Some(w)=&mut screen.wallpaper { w.scroll(0.0, -120.0); },
+                    5 if down => if let Some(w)=&mut screen.wallpaper { w.scroll(0.0, 120.0); },
+                    6 if down => if let Some(w)=&mut screen.wallpaper { w.scroll(-120.0, 0.0); },
+                    7 if down => if let Some(w)=&mut screen.wallpaper { w.scroll(120.0, 0.0); },
                     _ => {}
                 }
             }
@@ -456,6 +512,7 @@ impl App {
         wallpaper.set_volume(self.settings.volume as f32 / 100.0 * self.state.volume(&s.monitor.name, &path) as f32 / 100.0);
         wallpaper.set_particle_density(self.settings.particles as f32 / 100.0);
         wallpaper.apply_general_settings(&serde_json::json!({"fps": if self.settings.fps == 0 {60} else {self.settings.fps}}));
+        s.buttons(0);
         s.wallpaper = Some(wallpaper);
         s.path = Some(path);
         s.item = Some(item);
@@ -465,6 +522,10 @@ impl App {
     }
     fn settings_update(&mut self, settings: Settings) {
         let old_span=self.settings.span;
+        if settings.passthrough {
+            // Release any held buttons before removing the input region.
+            for screen in &mut self.screens { screen.buttons(0); }
+        }
         self.settings = settings;
         if old_span != self.settings.span {
             match monitors() {
@@ -702,7 +763,7 @@ fn create_screen(display:&Display,instance:&wgpu::Instance,gpu:Option<&Gpu>,m:Mo
         monitor:m,win,surface,config,wallpaper:None,path:None,item:None,
         paused:false,held:wpe_ipc::Limits::default(),last_render:Instant::now()-Duration::from_secs(1),
         fill:Fill::Auto,frames:0,fps:0.0,sampled:Instant::now(),
-        render_time:Duration::ZERO,render_max:Duration::ZERO,
+        render_time:Duration::ZERO,render_max:Duration::ZERO,pressed:0,
     },new_gpu))
 }
 fn main()->Result<()> {
@@ -714,16 +775,17 @@ fn main()->Result<()> {
         .context("Wallpaper Engine assets not found; pass --assets")?;
     let path=state::state_path();
     let mut saved=path.as_deref().map(state::State::load).unwrap_or_default();
-    let config=state::config_path().and_then(|p|state::load_config(&p).ok()).unwrap_or_default();
-    let mut settings=saved.settings.clone().unwrap_or(config);
+    let configured=state::config_path().and_then(|p|state::load_config(&p).ok());
+    let effective_passthrough=x11_passthrough(
+        saved.settings.as_ref().map(|s|s.passthrough),
+        configured.as_ref().map(|s|s.passthrough),
+        args.interactive,args.passthrough);
+    let mut settings=saved.settings.clone().or(configured).unwrap_or_default();
+    settings.passthrough=effective_passthrough;
     if let Some(v)=args.fps {settings.fps=v;}
     if let Some(v)=args.volume {settings.volume=v;}
     if args.audio {settings.audio=true;}
     if let Some(v)=args.fill {settings.fill=v;}
-    // X11 desktop backgrounds must leave desktop icons and context menus clickable.
-    // --interactive deliberately opts out (e.g. for mouse-reactive wallpapers).
-    settings.passthrough = !args.interactive;
-    if args.passthrough { settings.passthrough=true; }
     if let Some(wallpaper)=&args.wallpaper {
         let resolved=wpe_runtime::steam::resolve_wallpaper(wallpaper).map_err(anyhow::Error::msg)?;
         let mut entry=state::SavedOutput::new(resolved);
@@ -748,7 +810,8 @@ fn main()->Result<()> {
     let mut app=App{display,gpu:gpu.context("no selected X11 output")?,screens,assets,
         state:saved,state_path:path,settings,signals:wpe_ipc::Signals::default(),sound_rx,
         peers:vec![],subscribers:vec![],quit:false,
-        state_dirty:false,last_state_edit:Instant::now()};
+        state_dirty:false,last_state_edit:Instant::now(),
+        hit_window:0,hit_is_desktop:false};
     for i in 0..app.screens.len() {
         let name=app.screens[i].monitor.name.clone();
         if let Some(saved)=app.state.for_output(&name).cloned() {
@@ -809,17 +872,27 @@ fn main()->Result<()> {
             let root_window=unsafe {XRootWindow(app.display.0,app.display.1)};
             let pointer_ok=unsafe {XQueryPointer(app.display.0,root_window,
                 &mut root,&mut child,&mut rx,&mut ry,&mut wx,&mut wy,&mut mask)} != 0;
+            // Cinnamon/Nemo often owns the top-level desktop window, even
+            // while the wallpaper is visible and gets hover polling. X11
+            // ButtonPress events then go to Nemo instead of our window.
+            // When interactive mode is explicitly on, observe button-mask
+            // transitions as a fallback, but ONLY when the topmost window is
+            // a desktop surface (never over an application).
+            let desktop=pointer_ok && app.desktop_hit(child);
             for s in &mut app.screens {
-                if pointer_ok {
+                let inside=pointer_ok
+                    && rx>=s.monitor.x && ry>=s.monitor.y
+                    && i64::from(rx)<i64::from(s.monitor.x)+i64::from(s.monitor.width)
+                    && i64::from(ry)<i64::from(s.monitor.y)+i64::from(s.monitor.height);
+                if inside {
                     if let Some(w)=&mut s.wallpaper {
-                        // Keep coordinates bounded: when the pointer is
-                        // moving on another monitor, don't generate continuous
-                        // out-of-bounds Servo mouse events for this one.
                         let x=((rx-s.monitor.x) as f32/s.monitor.width.max(1) as f32).clamp(0.0,1.0);
                         let y=((ry-s.monitor.y) as f32/s.monitor.height.max(1) as f32).clamp(0.0,1.0);
                         w.set_pointer(glam::Vec2::new(x,y));
                     }
                 }
+                let buttons=if !app.settings.passthrough && desktop && inside { mask } else { 0 };
+                s.buttons(buttons);
                 s.render(&app.gpu,app.settings.fps,args.stats);
             }
             let cap=if app.settings.fps==0 {60}else{app.settings.fps.max(1)};
@@ -848,6 +921,14 @@ fn main()->Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn keeps_interactive_mode_across_restarts() {
+        assert!(x11_passthrough(None,None,false,false)); // safe default
+        assert!(!x11_passthrough(Some(false),None,false,false));
+        assert!(!x11_passthrough(None,Some(false),false,false));
+        assert!(!x11_passthrough(Some(true),None,true,false));
+        assert!(x11_passthrough(Some(false),None,false,true));
+        assert!(x11_passthrough(Some(false),None,true,true)); // passthrough wins
+    }
     #[test] fn spanning_geometry_handles_offset_monitors() {
         let screens=vec![
             Monitor{name:"A".into(),x:-1920,y:0,width:1920,height:1080},

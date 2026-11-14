@@ -39,6 +39,27 @@ fn text(d:*mut c_void,w:c_ulong,a:c_ulong)->String {
 fn numbers(d:*mut c_void,w:c_ulong,a:c_ulong)->Vec<c_ulong>{
     unsafe {property(d,w,a).map_or(vec![],|(_,_,numbers)|numbers)}
 }
+/// Whether the top-level window under a pointer is part of the desktop,
+/// rather than an application. Cinnamon/Nemo keeps its own desktop window on
+/// top of desktop-wallpaper windows, which blocks regular ButtonPress events.
+/// Only classify desktop windows for the sampled-input fallback; interactive
+/// clicks must never fire through a normal application.
+pub fn is_desktop(d: *mut c_void, window: c_ulong) -> bool {
+    if window == 0 {
+        return true; // Uncovered root window.
+    }
+    let kind = atom(d, b"_NET_WM_WINDOW_TYPE\0");
+    let desktop = atom(d, b"_NET_WM_WINDOW_TYPE_DESKTOP\0");
+    if numbers(d, window, kind).contains(&desktop) {
+        return true;
+    }
+    // Some desktop managers omit the EWMH type on their icon surface.
+    let class = text(d, window, atom(d, b"WM_CLASS\0")).to_lowercase();
+    class.contains("nemo-desktop") || class.contains("nemo-desktop-window")
+        || class.contains("xfdesktop") || class.contains("pcmanfm")
+        || class.contains("plasmashell")
+}
+
 /// Other applications' windows and their EWMH states. This works with EWMH
 /// window managers (Muffin, KWin X11, Xfwm, Openbox and most others).
 pub fn list(d:*mut c_void,root:c_ulong,outputs:&[(String,(i32,i32,u32,u32))])->Vec<WindowInfo>{
