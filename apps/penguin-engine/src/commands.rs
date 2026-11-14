@@ -381,19 +381,24 @@ pub fn browse_workshop(app: AppHandle, search: String, sort: String) -> Result<(
         "toprated" => "toprated",
         _ => "trend",
     };
-    let mut url = url::Url::parse("https://steamcommunity.com/workshop/browse/")
-        .map_err(|e| e.to_string())?;
-    {
-        let mut pairs = url.query_pairs_mut();
-        pairs.append_pair("appid", wpe_library::steam::APP_ID);
-        pairs.append_pair("section", "readytouseitems");
-        pairs.append_pair("browsesort", sort);
-        if !search.trim().is_empty() {
-            pairs.append_pair("searchtext", search.trim());
+    // Encode UTF-8 bytes for one query-string parameter; no additional
+    // URL dependency is required by the GUI crate.
+    let mut url = format!(
+        "https://steamcommunity.com/workshop/browse/?appid={}&section=readytouseitems&browsesort={sort}",
+        wpe_library::steam::APP_ID
+    );
+    if !search.trim().is_empty() {
+        url.push_str("&searchtext=");
+        for byte in search.trim().bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                url.push(byte as char);
+            } else {
+                url.push_str(&format!("%{byte:02X}"));
+            }
         }
     }
     app.opener()
-        .open_url(url.as_str(), None::<&str>)
+        .open_url(url, None::<&str>)
         .map_err(|e| e.to_string())
 }
 
