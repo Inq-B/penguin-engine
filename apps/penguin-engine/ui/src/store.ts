@@ -151,10 +151,19 @@ export async function apply(item: Item) {
 }
 
 /** Reload the selected wallpaper's properties (live or from its project). */
+/** Outputs actively displaying an item and included in the current target. */
+function matchingOutputs(item: Item | undefined): string[] {
+  if (!item) return [];
+  const s = get();
+  return s.status?.outputs
+    .filter((o) => (s.target === null || o.name === s.target) && o.wallpaper?.path === item.path)
+    .map((o) => o.name) ?? [];
+}
+
 export function refreshProps() {
   const s = get();
   const item = s.selected ? s.byId.get(s.selected) : undefined;
-  useProps.getState().load(item ?? null, liveOutput(item));
+  useProps.getState().load(item ?? null, liveOutput(item), matchingOutputs(item));
 }
 
 let libraryRefresh: Promise<number> | null = null;
@@ -234,7 +243,12 @@ function onStatus(status: Status) {
   const item = get().selected ? get().byId.get(get().selected!) : undefined;
   const wasLive = useProps.getState().output;
   const nowLive = liveOutput(item);
+  const active = matchingOutputs(item);
+  const prior = useProps.getState().outputs;
   if (wasLive !== nowLive || !before) refreshProps();
+  else if (active.length !== prior.length || active.some((name, i) => name !== prior[i])) {
+    useProps.setState({ outputs: active });
+  }
 }
 
 const SAVED_KEYS = Object.keys(saved) as (keyof Saved)[];

@@ -124,6 +124,24 @@ fn monitors() -> Result<Vec<Monitor>> {
     }
     Ok(result_monitors)
 }
+
+/// One spanning surface covers the union of all XRandR monitor rectangles.
+/// A single runtime/Servo page means animations and interactive content
+/// remain continuous instead of being duplicated on each monitor.
+fn desired_monitors(physical: &[Monitor], span: bool) -> Vec<Monitor> {
+    if !span || physical.len() < 2 {
+        return physical.to_vec();
+    }
+    let x = physical.iter().map(|m| m.x).min().unwrap_or(0);
+    let y = physical.iter().map(|m| m.y).min().unwrap_or(0);
+    let right = physical.iter().map(|m| i64::from(m.x) + i64::from(m.width)).max().unwrap_or(0);
+    let bottom = physical.iter().map(|m| i64::from(m.y) + i64::from(m.height)).max().unwrap_or(0);
+    vec![Monitor {
+        name: "SPAN".to_owned(), x, y,
+        width: (right - i64::from(x)).max(1) as u32,
+        height: (bottom - i64::from(y)).max(1) as u32,
+    }]
+}
 // Xlib's common button event prefix. The XEvent union is at least 24 longs.
 #[repr(C)]
 struct XButtonEvent {
@@ -274,6 +292,8 @@ struct App {
     peers: Vec<Peer>,
     subscribers: Vec<UnixStream>,
     quit: bool,
+    state_dirty: bool,
+    last_state_edit: Instant,
 }
 impl App {
     fn save(&self) {
@@ -368,6 +388,61 @@ impl App {
             None => Ok((0..self.screens.len()).collect()),
         }
     }
+    /// Apply geometry changes without disturbing unchanged outputs.
+    /// Physical assignments remain in state when enabling SPAN.
+    fn reconcile_monitors(&mut self, desired: &[Monitor]) -> Result<()> {
+        let mut changed=false;
+        let fallback = self.screens.iter().find_map(|s| s.path.clone()
+            .map(|path| (path, s.monitor.name.clone())));
+        let mut index=0;
+        while index<self.screens.len() {
+            if desired.iter().any(|m| m.name == self.screens[index].monitor.name) {
+                index+=1;
+            } else {
+                changed=true;
+                let screen=self.screens.remove(index);
+                let win=screen.win;
+                drop(screen);
+                unsafe { XDestroyWindow(self.display.0,win); }
+            }
+        }
+        for monitor in desired {
+            if let Some(screen)=self.screens.iter_mut().find(|s|s.monitor.name==monitor.name) {
+                if screen.monitor!=*monitor {
+                    changed=true;
+                    screen.monitor=monitor.clone();
+                    unsafe {XMoveResizeWindow(self.display.0,screen.win,monitor.x,monitor.y,monitor.width,monitor.height);}
+                    screen.config.width=monitor.width.max(1);
+                    screen.config.height=monitor.height.max(1);
+                    screen.surface.configure(&self.gpu.device,&screen.config);
+                }
+                continue;
+            }
+            changed=true;
+            let (screen,_)=create_screen(&self.display,&self.gpu.instance,Some(&self.gpu),
+                monitor.clone(),self.settings.passthrough)?;
+            self.screens.push(screen);
+            let i=self.screens.len()-1;
+            let saved=self.state.for_output(&monitor.name).cloned();
+            let chosen=saved.or_else(|| {
+                fallback.as_ref().map(|(path,_)| state::SavedOutput::new(path.clone()))
+            });
+            if let Some(saved)=chosen {
+                self.screens[i].fill=saved.fill.unwrap_or(self.settings.fill);
+                if let Err(e)=self.load(i,saved.wallpaper.clone(),saved.properties.clone()) {
+                    tracing::warn!("{}: {e:#}",monitor.name);
+                } else if monitor.name=="SPAN" {
+                    self.state.set_wallpaper("SPAN",&saved.wallpaper,saved.properties);
+                    self.state_dirty=true;
+                }
+            }
+        }
+        if changed {
+            unsafe {XFlush(self.display.0);}
+            self.publish();
+        }
+        Ok(())
+    }
     fn load(&mut self, i: usize, path: PathBuf, properties: BTreeMap<String,serde_json::Value>) -> Result<()> {
         let item = preset::resolve(&path).map_err(anyhow::Error::msg)?;
         let name = self.screens[i].monitor.name.clone();
@@ -389,7 +464,19 @@ impl App {
         Ok(())
     }
     fn settings_update(&mut self, settings: Settings) {
+        let old_span=self.settings.span;
         self.settings = settings;
+        if old_span != self.settings.span {
+            match monitors() {
+                Ok(physical) => {
+                    let desired=desired_monitors(&physical,self.settings.span);
+                    if let Err(e)=self.reconcile_monitors(&desired) {
+                        tracing::error!("changing span layout: {e:#}");
+                    }
+                }
+                Err(e)=>tracing::warn!("discovering displays: {e:#}"),
+            }
+        }
         for (i,s) in self.screens.iter_mut().enumerate() {
             self.display.passthrough(s.win, self.settings.passthrough);
             if let Some(w) = s.wallpaper.as_mut() {
@@ -470,21 +557,30 @@ impl App {
                             }
                         }
                     }
-                    self.save();Ok(Response::ok())
+                    self.state_dirty=true;
+                    self.last_state_edit=Instant::now();
+                    Ok(Response::ok())
                 },
                 Request::SetProperties{output,values} => {
                     for i in self.target(output.as_deref())? {
                         let s=&mut self.screens[i];
                         if let Some(w)=&mut s.wallpaper {
-                            for (name,value) in &values {
-                                if w.project().general.properties.contains_key(name) {
-                                    w.set_user_property(&self.gpu,name,value.clone());
-                                    if let Some(p)=&s.path {self.state.set_property(&s.monitor.name,p,name,value.clone());}
+                            let changes:Vec<_>=values.iter()
+                                .filter(|(name, value)| w.project().general.properties.contains_key(*name)
+                                    && w.user_property(name) != Some(*value))
+                                .map(|(name,value)|(name.clone(),value.clone())).collect();
+                            if changes.is_empty() { continue; }
+                            w.set_user_properties(&self.gpu,&changes);
+                            for (name,value) in changes {
+                                if let Some(p)=&s.path {
+                                    self.state.set_property(&s.monitor.name,p,&name,value);
                                 }
                             }
+                            self.state_dirty=true;
+                            self.last_state_edit=Instant::now();
                         }
                     }
-                    self.save();Ok(Response::ok())
+                    Ok(Response::ok())
                 },
                 Request::ResetProperties{output} => {
                     for i in self.target(output.as_deref())? {
@@ -552,6 +648,10 @@ impl App {
             while let Some(end)=peer.buffer.iter().position(|b|*b==b'\n') {
                 let line:Vec<_>=peer.buffer.drain(..=end).collect();
                 let request=serde_json::from_slice::<Request>(&line);
+                let notify=matches!(&request,
+                    Ok(Request::Set{..}|Request::Fill{..}|Request::Settings{..}
+                    |Request::Pause{..}|Request::Resume{..}|Request::Audio{..}
+                    |Request::Volume{..}|Request::Fps{..}|Request::WallpaperVolume{..}));
                 let result=match request {
                     Ok(Request::Subscribe)=>{
                         let ok=serde_json::to_vec(&Response::ok()).unwrap();
@@ -566,7 +666,7 @@ impl App {
                 };
                 let json=serde_json::to_vec(&result).unwrap();
                 if peer.socket.write_all(&[json.as_slice(),b"\n"].concat()).is_err(){alive=false;break;}
-                self.publish();
+                if notify { self.publish(); }
             }
             if peer.buffer.len()>1024*1024 {alive=false;}
             if alive {remaining.push(peer);}
@@ -632,7 +732,7 @@ fn main()->Result<()> {
         if let Some(p)=&path {saved.save(p)?;}
     }
     let display=Display::open()?;
-    let outputs=monitors()?;
+    let outputs=desired_monitors(&monitors()?,settings.span);
     if outputs.is_empty(){bail!("no active X11 outputs reported by xrandr");}
     let instance=wgpu::Instance::default();
     let mut gpu:Option<Gpu>=None;
@@ -647,7 +747,8 @@ fn main()->Result<()> {
     x11_sound_watch::watch(sound_tx);
     let mut app=App{display,gpu:gpu.context("no selected X11 output")?,screens,assets,
         state:saved,state_path:path,settings,signals:wpe_ipc::Signals::default(),sound_rx,
-        peers:vec![],subscribers:vec![],quit:false};
+        peers:vec![],subscribers:vec![],quit:false,
+        state_dirty:false,last_state_edit:Instant::now()};
     for i in 0..app.screens.len() {
         let name=app.screens[i].monitor.name.clone();
         if let Some(saved)=app.state.for_output(&name).cloned() {
@@ -680,43 +781,22 @@ fn main()->Result<()> {
             }
         }
         app.poll_peers();
+        // Coalesce rapid property changes into a single atomic state write.
+        if app.state_dirty && app.last_state_edit.elapsed()>=Duration::from_millis(700) {
+            app.save();
+            app.state_dirty=false;
+        }
         app.poll_input();
         if last_signals.elapsed()>=Duration::from_millis(500) {
             app.poll_signals();
             last_signals=Instant::now();
         }
         if last_scan.elapsed()>=Duration::from_secs(2) {
-            if let Ok(found)=monitors() {
-                for m in &found {
-                    if let Some(screen)=app.screens.iter_mut().find(|s|s.monitor.name==m.name) {
-                        if &screen.monitor!=m {
-                            screen.monitor=m.clone();
-                            unsafe {XMoveResizeWindow(app.display.0,screen.win,m.x,m.y,m.width,m.height);}
-                            screen.config.width=m.width.max(1);
-                            screen.config.height=m.height.max(1);
-                            screen.surface.configure(&app.gpu.device,&screen.config);
-                        }
-                    } else if args.output.as_ref().is_none_or(|name|name==&m.name) {
-                        let (screen,_)=create_screen(&app.display,&app.gpu.instance,Some(&app.gpu),m.clone(),app.settings.passthrough)?;
-                        app.screens.push(screen);
-                        let i=app.screens.len()-1;
-                        if let Some(saved)=app.state.for_output(&m.name).cloned() {
-                            app.screens[i].fill=saved.fill.unwrap_or(app.settings.fill);
-                            if let Err(e)=app.load(i,saved.wallpaper,saved.properties){tracing::warn!("{e:#}");}
-                        }
-                        app.publish();
-                    }
+            if let Ok(physical)=monitors() {
+                let desired=desired_monitors(&physical,app.settings.span);
+                if let Err(e)=app.reconcile_monitors(&desired) {
+                    tracing::warn!("X11 monitor update: {e:#}");
                 }
-                let mut i=0;
-                while i<app.screens.len() {
-                    if !found.iter().any(|m|m.name==app.screens[i].monitor.name) {
-                        let screen=app.screens.remove(i);
-                        let win=screen.win;drop(screen);
-                        unsafe {XDestroyWindow(app.display.0,win);}
-                        app.publish();
-                    } else {i+=1;}
-                }
-                unsafe {XFlush(app.display.0);}
             }
             last_scan=Instant::now();
         }
@@ -755,6 +835,7 @@ fn main()->Result<()> {
         let until=next_frame.saturating_duration_since(Instant::now());
         std::thread::sleep(until.min(Duration::from_millis(5)));
     }
+    if app.state_dirty { app.save(); }
     app.subscribers.clear();
     app.peers.clear();
     app.screens.clear();
@@ -767,6 +848,18 @@ fn main()->Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn spanning_geometry_handles_offset_monitors() {
+        let screens=vec![
+            Monitor{name:"A".into(),x:-1920,y:0,width:1920,height:1080},
+            Monitor{name:"B".into(),x:0,y:180,width:2560,height:1440},
+        ];
+        let span=desired_monitors(&screens,true);
+        assert_eq!(span.len(),1);
+        assert_eq!(span[0].name,"SPAN");
+        assert_eq!((span[0].x,span[0].y,span[0].width,span[0].height),
+            (-1920,0,4480,1620));
+        assert_eq!(desired_monitors(&screens,false),screens);
+    }
     #[test] fn parse_xrandr_geometry() {
         assert_eq!(geometry("1920x1080+0+0"),Some((1920,1080,0,0)));
         assert_eq!(geometry("2560x1440-1920+0"),Some((2560,1440,-1920,0)));

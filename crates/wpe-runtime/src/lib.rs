@@ -878,22 +878,39 @@ impl Wallpaper {
         self.scripts = Some(scripts);
     }
 
-    /// Change a user property, as a settings UI does: the scene is rebuilt
-    /// with the new value and scripts get `applyUserProperties`. `value` is
-    /// the property's value (`true`, `0.5`, `"1 0 0"`, ...).
+    /// Set one property with the same batching path as several properties.
     pub fn set_user_property(&mut self, gpu: &Gpu, name: &str, value: serde_json::Value) {
-        self.props.set(name, value.clone());
+        self.set_user_properties(gpu, &[(name.to_owned(), value)]);
+    }
+
+    /// Apply several property edits in a single rebuild. Scenes used to
+    /// rebuild their entire GPU frame once *per property*; sliders could
+    /// trigger a rebuild on every pointer event. Web pages now receive one
+    /// applyUserProperties payload instead of a chain of JS messages.
+    pub fn set_user_properties(&mut self, gpu: &Gpu, changes: &[(String, serde_json::Value)]) {
+        if changes.is_empty() {
+            return;
+        }
+        let changes: Vec<_> = changes.iter()
+            .filter(|(name, value)| self.project.general.properties.contains_key(name)
+                && self.props.get(name) != Some(value))
+            .cloned()
+            .collect();
+        if changes.is_empty() {
+            return;
+        }
+        for (name, value) in &changes {
+            self.props.set(name, value.clone());
+        }
         #[cfg(feature = "web")]
         if let Some(web) = &self.web {
-            // Pages apply properties themselves.
-            let kind = self
-                .project
-                .general
-                .properties
-                .get(name)
-                .and_then(|p| p.kind.as_deref());
-            let changed = serde_json::json!({ name: web_wallpaper::property_json(kind, &value) });
-            web.page.apply_properties(&changed);
+            let mut payload = serde_json::Map::new();
+            for (name, value) in &changes {
+                let kind = self.project.general.properties
+                    .get(name).and_then(|p| p.kind.as_deref());
+                payload.insert(name.clone(), web_wallpaper::property_json(kind, value));
+            }
+            web.page.apply_properties(&serde_json::Value::Object(payload));
             return;
         }
         let doc = match serde_json::from_value::<wpe_assets::Scene>(self.scene_json.clone()) {
@@ -908,7 +925,9 @@ impl Wallpaper {
             let objects = objects(&self.scene_json);
             let sounds = self.sounds.states();
             scripts.rebind(&built.view(&objects, &self.scene_json["general"], &sounds));
-            scripts.user_property_changed(name, value);
+            for (name, value) in changes {
+                scripts.user_property_changed(&name, value);
+            }
         }
     }
 

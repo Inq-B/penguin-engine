@@ -303,7 +303,11 @@ function Field({ p, value }: { p: Property; value: Value }) {
             value={v}
             onInput={(e) => {
               const n = +(e.target as HTMLInputElement).value;
-              set(p.name, integer ? Math.round(n) : n);
+              set(p.name, integer ? Math.round(n) : n, false);
+            }}
+            onChange={(e) => {
+              const n = +(e.target as HTMLInputElement).value;
+              set(p.name, integer ? Math.round(n) : n, true);
             }}
           />
         </label>
@@ -328,14 +332,14 @@ function Field({ p, value }: { p: Property; value: Value }) {
       return (
         <label class="prop inline">
           <span>{p.label}</span>
-          <input type="color" class="color-input" value={toHex(value)} onInput={(e) => set(p.name, fromHex((e.target as HTMLInputElement).value))} />
+          <input type="color" class="color-input" value={toHex(value)} onInput={(e) => set(p.name, fromHex((e.target as HTMLInputElement).value), false)} onChange={(e) => set(p.name, fromHex((e.target as HTMLInputElement).value), true)} />
         </label>
       );
     case "textinput":
       return (
         <label class="prop">
           <span>{p.label}</span>
-          <input class="field" style={{ height: 30 }} value={String(value ?? "")} onInput={(e) => set(p.name, (e.target as HTMLInputElement).value)} />
+          <input class="field" style={{ height: 30 }} value={String(value ?? "")} onInput={(e) => set(p.name, (e.target as HTMLInputElement).value, false)} onBlur={(e) => set(p.name, (e.target as HTMLInputElement).value, true)} />
         </label>
       );
     case "text":

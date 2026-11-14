@@ -34,6 +34,7 @@ export interface Settings {
   fill: Fill;
   layer: Layer;
   passthrough: boolean;
+  span: boolean;
   /** Percent of the particles wallpapers ask for. */
   particles: number;
   rules: Rule[];
@@ -154,7 +155,7 @@ export type Request =
   | { cmd: "set-properties"; output?: string; values: Values }
   | { cmd: "reset-properties"; output?: string }
   | { cmd: "pause" | "resume"; output?: string }
-  | { cmd: "settings"; fps?: number; audio?: boolean; volume?: number; fill?: Fill; layer?: Layer; passthrough?: boolean; particles?: number; rules?: Rule[] }
+  | { cmd: "settings"; fps?: number; audio?: boolean; volume?: number; fill?: Fill; layer?: Layer; passthrough?: boolean; span?: boolean; particles?: number; rules?: Rule[] }
   | { cmd: "signals" }
   | { cmd: "wallpaper-volume"; output?: string; volume: number }
   | { cmd: "fill"; output?: string; fill: Fill };

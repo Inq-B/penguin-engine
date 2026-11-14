@@ -168,6 +168,7 @@ function Performance({ settings }: { settings: DaemonSettings }) {
 }
 
 function Displays({ settings }: { settings: DaemonSettings }) {
+  const x11 = useApp((s) => s.daemonFeatures.includes("x11"));
   const outputs = useApp((s) => s.status?.outputs ?? []);
   const target = useApp((s) => s.target);
   const items = useApp((s) => s.items);
@@ -177,6 +178,18 @@ function Displays({ settings }: { settings: DaemonSettings }) {
   const setFill = (f: Fill) => (target ? request({ cmd: "fill", output: target, fill: f }) : patch({ fill: f }));
   return (
     <>
+      {x11 && (
+        <Setting
+          label="Span one wallpaper across all monitors"
+          hint="Render one continuous wallpaper over the full X11 desktop instead of repeating it on each monitor. Works best for adjacent monitors. Your separate monitor assignments are retained."
+        >
+          <Toggle on={settings.span ?? false} onChange={(span) => patch({ span })} />
+        </Setting>
+      )}
+      {settings.span && x11 && <div class="hint" style={{ textAlign: "left" }}>
+        Spanning uses a single wallpaper renderer and one virtual output named SPAN.
+        Disable it to restore separate monitor wallpapers.
+      </div>}
       <div class="displays">
         {outputs.map((o, n) => {
           const scale = 200 / biggest;

@@ -1,54 +1,76 @@
-// The selected wallpaper's user properties. On a wallpaper that is showing,
-// edits go to the daemon as they happen, at most one request per property
-// in flight (the newest value follows when it returns), so a slider drag
-// goes as fast as the wallpaper rebuilds. Otherwise they wait for Apply.
+// Wallpaper property edits are buffered so scenes aren't rebuilt for every
+// slider movement. Web properties are committed more frequently; sliders
+// always flush when released. Updates go to every selected monitor showing
+// this same wallpaper, never to unrelated wallpapers.
 import { create } from "zustand";
 import { api, type Item, type Property, type Value, type Values } from "./api";
 
 interface PropsState {
   itemId: string | null;
-  /** The output the values are live on; null when the wallpaper isn't showing. */
   output: string | null;
+  /** Displays showing this wallpaper and selected by the Apply target. */
+  outputs: string[];
+  kind: string | null;
   props: Property[];
   values: Values;
-  /** Which properties show (their conditions hold). */
   visible: Record<string, boolean>;
   loading: boolean;
-  load: (item: Item | null, output: string | null) => Promise<void>;
-  set: (name: string, value: Value) => void;
-  /** Several values at once (a preset): one request. */
+  load: (item: Item | null, output: string | null, outputs?: string[]) => Promise<void>;
+  /** commit=false while dragging or typing, commit=true on release. */
+  set: (name: string, value: Value, commit?: boolean) => void;
   setMany: (values: Values) => Promise<void>;
   reset: () => Promise<void>;
-  /** The daemon reports `output`'s values. */
   sync: (output: string, values: Values) => void;
-  /** Values that differ from the defaults. */
   changed: () => Values;
 }
 
+const pending = new Map<string, Value>();
 const inflight = new Set<string>();
-const queued = new Map<string, Value>();
 let generation = 0;
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
+let sending = false;
+
+function clearFlushTimer() {
+  if (flushTimer !== null) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+}
 
 export const useProps = create<PropsState>()((set, get) => {
-  const send = (name: string, value: Value) => {
-    const output = get().output;
-    if (!output) return;
+  const flush = async (): Promise<void> => {
+    clearFlushTimer();
+    if (sending || !pending.size) return;
+    const { outputs } = get();
+    if (!outputs.length) {
+      pending.clear();
+      return;
+    }
+    const values = Object.fromEntries(pending);
+    pending.clear();
+    const keys = Object.keys(values);
     const current = generation;
-    inflight.add(name);
-    api
-      .daemon({ cmd: "property", output, name, value })
-      .catch((e) => console.warn(`setting ${name}: ${e}`))
-      .finally(() => {
-        // A reply to the previous wallpaper must not replay a queued slider
-        // change on whichever wallpaper was selected in the meantime.
-        if (current !== generation || get().output !== output) return;
-        inflight.delete(name);
-        if (queued.has(name)) {
-          const next = queued.get(name)!;
-          queued.delete(name);
-          send(name, next);
-        }
-      });
+    sending = true;
+    keys.forEach((key) => inflight.add(key));
+    try {
+      const replies = await Promise.allSettled(
+        outputs.map((output) => api.daemon({ cmd: "set-properties", output, values })),
+      );
+      for (const result of replies) {
+        if (result.status === "rejected") console.warn("setting wallpaper properties:", result.reason);
+      }
+    } finally {
+      if (generation === current) {
+        keys.forEach((key) => inflight.delete(key));
+      }
+      sending = false;
+      if (pending.size) schedule(0);
+    }
+  };
+
+  const schedule = (delay: number) => {
+    clearFlushTimer();
+    flushTimer = setTimeout(() => { void flush(); }, delay);
   };
 
   const evaluate = () => {
@@ -56,70 +78,79 @@ export const useProps = create<PropsState>()((set, get) => {
     const conditions: Record<string, string> = {};
     for (const p of props) if (p.condition) conditions[p.name] = p.condition;
     if (!Object.keys(conditions).length) return;
-    const gen = generation;
+    const current = generation;
     api.conditions(conditions, values).then((visible) => {
-      if (gen === generation) set({ visible });
-    });
+      if (current === generation) set({ visible });
+    }).catch((e) => console.warn("property conditions:", e));
   };
 
   return {
     itemId: null,
     output: null,
+    outputs: [],
+    kind: null,
     props: [],
     values: {},
     visible: {},
     loading: false,
 
-    load: async (item, output) => {
-      const gen = ++generation;
+    load: async (item, output, outputs = output ? [output] : []) => {
+      // A pending edit should reach its old wallpaper before switching away.
+      if (pending.size) await flush();
+      const current = ++generation;
+      clearFlushTimer();
+      pending.clear();
       inflight.clear();
-      queued.clear();
       if (!item) {
-        set({ itemId: null, output: null, props: [], values: {}, visible: {}, loading: false });
+        set({ itemId: null, output: null, outputs: [], kind: null, props: [], values: {}, visible: {}, loading: false });
         return;
       }
-      set({ itemId: item.id, output, loading: true });
+      set({ itemId: item.id, output, outputs, kind: item.kind, loading: true });
       try {
         const r = await api.properties(item.id, output ?? undefined);
-        if (gen !== generation) return;
+        if (current !== generation) return;
         const values: Values = {};
         for (const p of r.properties) values[p.name] = p.value;
         set({ props: r.properties, values, visible: {}, loading: false, output: r.output });
         evaluate();
       } catch (e) {
-        if (gen === generation) set({ props: [], values: {}, loading: false });
-        console.warn(`properties: ${e}`);
+        if (current === generation) set({ props: [], values: {}, loading: false });
+        console.warn("properties:", e);
       }
     },
 
-    set: (name, value) => {
+    set: (name, value, commit = true) => {
       set((s) => ({ values: { ...s.values, [name]: value } }));
       evaluate();
-      if (!get().output) return;
-      if (inflight.has(name)) queued.set(name, value);
-      else send(name, value);
+      if (!get().outputs.length) return;
+      pending.set(name, value);
+      // A scene rebuild can be expensive; don't repeatedly rebuild it
+      // while dragging. Web pages tolerate a more responsive rate.
+      schedule(commit ? 0 : get().kind === "scene" ? 450 : 100);
     },
 
     setMany: async (values) => {
+      if (pending.size) await flush();
       set((s) => ({ values: { ...s.values, ...values } }));
       evaluate();
-      const output = get().output;
-      if (output) await api.daemon({ cmd: "set-properties", output, values });
+      const outputs = get().outputs;
+      await Promise.all(outputs.map((output) => api.daemon({ cmd: "set-properties", output, values })));
     },
 
     reset: async () => {
+      if (pending.size) await flush();
       const defaults: Values = {};
       for (const p of get().props) defaults[p.name] = p.default;
       set({ values: defaults });
       evaluate();
-      const output = get().output;
-      if (output) await api.daemon({ cmd: "reset-properties", output });
+      await Promise.all(get().outputs.map((output) => api.daemon({ cmd: "reset-properties", output })));
     },
 
     sync: (output, values) => {
-      if (output !== get().output) return;
+      if (!get().outputs.includes(output)) return;
       const next = { ...get().values };
-      for (const [k, v] of Object.entries(values)) if (!inflight.has(k)) next[k] = v;
+      for (const [k, v] of Object.entries(values))
+        if (!inflight.has(k) && !pending.has(k)) next[k] = v;
       set({ values: next });
       evaluate();
     },
@@ -127,7 +158,8 @@ export const useProps = create<PropsState>()((set, get) => {
     changed: () => {
       const { props, values } = get();
       const out: Values = {};
-      for (const p of props) if (p.name in values && values[p.name] !== p.default) out[p.name] = values[p.name];
+      for (const p of props)
+        if (p.name in values && values[p.name] !== p.default) out[p.name] = values[p.name];
       return out;
     },
   };

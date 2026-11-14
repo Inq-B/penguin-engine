@@ -131,6 +131,8 @@ pub struct Settings {
     pub layer: Layer,
     /// Let pointer input through to what is underneath.
     pub passthrough: bool,
+    /// X11: use one wallpaper surface spanning the entire virtual desktop.
+    pub span: bool,
     /// Particles, in percent of what wallpapers ask for. (Protocol 2.)
     pub particles: u32,
     /// What holds wallpapers back, and when. (Protocol 2.)
@@ -147,6 +149,7 @@ impl Settings {
             fill: patch.fill.unwrap_or(self.fill),
             layer: patch.layer.unwrap_or(self.layer),
             passthrough: patch.passthrough.unwrap_or(self.passthrough),
+            span: patch.span.unwrap_or(self.span),
             particles: patch.particles.unwrap_or(self.particles),
             rules: patch.rules.clone().unwrap_or_else(|| self.rules.clone()),
         }
@@ -171,6 +174,8 @@ pub struct SettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passthrough: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub particles: Option<u32>,
     /// All the rules, replacing the old ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -186,6 +191,7 @@ impl Default for Settings {
             fill: Fill::Auto,
             layer: Layer::Background,
             passthrough: false,
+            span: false,
             particles: 100,
             rules: Rule::defaults(),
         }
