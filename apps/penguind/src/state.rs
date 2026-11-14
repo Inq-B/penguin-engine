@@ -58,6 +58,21 @@ impl SavedOutput {
     }
 }
 
+/// Settings retained for a wallpaper after switching away from it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SavedWallpaper {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<u32>,
+}
+
+impl From<&SavedOutput> for SavedWallpaper {
+    fn from(value: &SavedOutput) -> Self {
+        Self { properties: value.properties.clone(), volume: value.volume }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct State {
     /// Settings changed over the socket; they win over the config file
@@ -70,6 +85,9 @@ pub struct State {
     /// The wallpaper set last, for outputs without their own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<SavedOutput>,
+    /// Overrides keyed by wallpaper path, independent of the current output.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub wallpapers: BTreeMap<PathBuf, SavedWallpaper>,
 }
 
 impl State {
@@ -85,9 +103,13 @@ impl State {
                 return Self::default();
             }
         };
-        serde_json::from_str(&text)
+        let mut state: Self = serde_json::from_str(&text)
             .inspect_err(|e| tracing::warn!("{}: {e}; starting afresh", path.display()))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Older state files stored only the active wallpaper on each output.
+        // Preserve those overrides so changing wallpaper no longer discards them.
+        state.migrate_legacy();
+        state
     }
 
     /// Write the state to `path` atomically (a temporary file renamed over it).
@@ -108,55 +130,107 @@ impl State {
         Ok(())
     }
 
-    /// What output `name` should show: its own wallpaper, or else the one
-    /// set last.
+    /// Upgrade the old output-only state format without losing any values.
+    fn migrate_legacy(&mut self) {
+        if let Some(saved) = &self.last {
+            self.wallpapers
+                .entry(saved.wallpaper.clone())
+                .or_insert_with(|| SavedWallpaper::from(saved));
+        }
+        for saved in self.outputs.values() {
+            self.wallpapers
+                .entry(saved.wallpaper.clone())
+                .or_insert_with(|| SavedWallpaper::from(saved));
+        }
+    }
+
+    /// The last saved customizations for a wallpaper, even if it is not active.
+    fn remembered(&self, wallpaper: &Path) -> SavedWallpaper {
+        self.wallpapers.get(wallpaper).cloned()
+            .or_else(|| self.outputs.values()
+                .find(|entry| entry.wallpaper == wallpaper)
+                .map(SavedWallpaper::from))
+            .or_else(|| self.last.as_ref()
+                .filter(|entry| entry.wallpaper == wallpaper)
+                .map(SavedWallpaper::from))
+            .unwrap_or_default()
+    }
+
+    /// Remembered values plus changes explicitly supplied for this activation.
+    pub fn properties_for(
+        &self,
+        _name: &str,
+        wallpaper: &Path,
+        requested: &BTreeMap<String, Value>,
+    ) -> BTreeMap<String, Value> {
+        let mut properties = self.remembered(wallpaper).properties;
+        properties.extend(requested.iter().map(|(k, v)| (k.clone(), v.clone())));
+        properties
+    }
+
+    /// What output `name` should show: its own wallpaper, or else the one set last.
     pub fn for_output(&self, name: &str) -> Option<&SavedOutput> {
         self.outputs.get(name).or(self.last.as_ref())
     }
 
-    /// Output `name` now shows `wallpaper`, with `properties` changed from
-    /// its defaults.
+    /// Switch the output, retaining the old wallpaper and restoring the new
+    /// wallpaper's saved appearance (unless explicit values override it).
     pub fn set_wallpaper(
         &mut self,
         name: &str,
         wallpaper: &Path,
-        properties: BTreeMap<String, Value>,
+        requested: BTreeMap<String, Value>,
     ) {
+        self.migrate_legacy();
+        let remembered = self.remembered(wallpaper);
+        let properties = self.properties_for(name, wallpaper, &requested);
         let fill = self.outputs.get(name).and_then(|o| o.fill);
         let entry = SavedOutput {
+            wallpaper: wallpaper.to_owned(),
+            properties: properties.clone(),
             fill,
-            properties,
-            ..SavedOutput::new(wallpaper.to_owned())
+            volume: remembered.volume,
         };
-        self.last = Some(SavedOutput {
-            fill: None,
-            ..entry.clone()
-        });
+        self.last = Some(SavedOutput { fill: None, ..entry.clone() });
         self.outputs.insert(name.to_owned(), entry);
+        self.wallpapers.insert(wallpaper.to_owned(), SavedWallpaper {
+            properties, volume: remembered.volume,
+        });
     }
 
-    /// Show `wallpaper` everywhere: on every output, now and new.
-    pub fn set_everywhere(&mut self, wallpaper: SavedOutput) {
+    /// Show a wallpaper everywhere without discarding previously saved looks.
+    pub fn set_everywhere(&mut self, mut wallpaper: SavedOutput) {
+        self.migrate_legacy();
+        let saved = self.remembered(&wallpaper.wallpaper);
+        let mut properties = saved.properties;
+        properties.extend(wallpaper.properties);
+        wallpaper.properties = properties.clone();
+        wallpaper.volume = wallpaper.volume.or(saved.volume);
+        self.wallpapers.insert(wallpaper.wallpaper.clone(), SavedWallpaper {
+            properties, volume: wallpaper.volume,
+        });
         self.outputs.clear();
         self.last = Some(wallpaper);
     }
 
-    /// Remember a user property change on output `name` (which shows `wallpaper`).
+    /// Remember one property change on the current output and its wallpaper.
     pub fn set_property(&mut self, name: &str, wallpaper: &Path, property: &str, value: Value) {
-        let entry = self.entry(name, wallpaper);
-        entry.properties.insert(property.to_owned(), value);
-        let properties = entry.properties.clone();
-        // New outputs showing the same wallpaper get the same look.
+        self.entry(name, wallpaper).properties.insert(property.to_owned(), value.clone());
+        self.wallpapers.entry(wallpaper.to_owned()).or_default()
+            .properties.insert(property.to_owned(), value);
         if let Some(last) = &mut self.last
             && last.wallpaper == wallpaper
         {
-            last.properties = properties;
+            last.properties.insert(property.to_owned(), self.wallpapers[wallpaper].properties[property].clone());
         }
     }
 
-    /// Forget the property changes on output `name` (which shows `wallpaper`).
+    /// Reset saved property changes for this wallpaper, including the cache.
     pub fn clear_properties(&mut self, name: &str, wallpaper: &Path) {
-        if let Some(entry) = self.outputs.get_mut(name) {
+        self.wallpapers.entry(wallpaper.to_owned()).or_default().properties.clear();
+        if let Some(entry) = self.outputs.get_mut(name)
+            && entry.wallpaper == wallpaper
+        {
             entry.properties.clear();
         }
         if let Some(last) = &mut self.last
@@ -166,11 +240,11 @@ impl State {
         }
     }
 
-    /// Output `name` (showing `wallpaper`) plays it at `volume` percent.
+    /// Save one wallpaper's own volume.
     pub fn set_volume(&mut self, name: &str, wallpaper: &Path, volume: u32) {
         let volume = (volume != 100).then_some(volume);
         self.entry(name, wallpaper).volume = volume;
-        // New outputs showing the same wallpaper sound the same.
+        self.wallpapers.entry(wallpaper.to_owned()).or_default().volume = volume;
         if let Some(last) = &mut self.last
             && last.wallpaper == wallpaper
         {
@@ -178,11 +252,12 @@ impl State {
         }
     }
 
-    /// The volume output `name` plays `wallpaper` at, in percent.
+    /// The selected wallpaper's volume, including saved values from earlier.
     pub fn volume(&self, name: &str, wallpaper: &Path) -> u32 {
-        self.for_output(name)
-            .filter(|saved| saved.wallpaper == wallpaper)
-            .and_then(|saved| saved.volume)
+        self.outputs.get(name)
+            .filter(|s| s.wallpaper == wallpaper)
+            .and_then(|s| s.volume)
+            .or_else(|| self.remembered(wallpaper).volume)
             .unwrap_or(100)
     }
 
@@ -190,30 +265,27 @@ impl State {
         self.entry(name, wallpaper).fill = fill;
     }
 
-    /// Output `name`'s own entry, made from what it shows (`wallpaper`,
-    /// with the last one's properties when it is that one) if it has none.
+    /// Ensure an output entry points to the currently playing wallpaper.
     fn entry(&mut self, name: &str, wallpaper: &Path) -> &mut SavedOutput {
-        let last = self
-            .last
-            .as_ref()
-            .filter(|last| last.wallpaper == wallpaper);
-        let inherited = last.map(|last| last.properties.clone()).unwrap_or_default();
-        let volume = last.and_then(|last| last.volume);
-        self.outputs
-            .entry(name.to_owned())
-            .or_insert_with(|| SavedOutput {
-                properties: inherited,
-                volume,
-                ..SavedOutput::new(wallpaper.to_owned())
-            })
+        if self.outputs.get(name).is_none_or(|s| s.wallpaper != wallpaper) {
+            let remembered = self.remembered(wallpaper);
+            let fill = self.outputs.get(name).and_then(|s| s.fill);
+            self.outputs.insert(name.to_owned(), SavedOutput {
+                wallpaper: wallpaper.to_owned(),
+                properties: remembered.properties,
+                volume: remembered.volume,
+                fill,
+            });
+        }
+        self.outputs.get_mut(name).expect("just inserted output")
     }
 
-    /// The property changes output `name` (showing `wallpaper`) has.
+    /// Current or remembered property changes, for live reloads and the GUI.
     pub fn overrides(&self, name: &str, wallpaper: &Path) -> BTreeMap<String, Value> {
-        self.for_output(name)
-            .filter(|saved| saved.wallpaper == wallpaper)
-            .map(|saved| saved.properties.clone())
-            .unwrap_or_default()
+        self.outputs.get(name)
+            .filter(|s| s.wallpaper == wallpaper)
+            .map(|s| s.properties.clone())
+            .unwrap_or_else(|| self.remembered(wallpaper).properties)
     }
 }
 
@@ -350,6 +422,57 @@ mod tests {
         assert_eq!(dp2.properties["y"], json!(1));
         assert_eq!(state.overrides("DP-1", Path::new("/w/9")).len(), 2);
         assert!(state.overrides("DP-1", Path::new("/w/8")).is_empty());
+    }
+
+    #[test]
+    fn retains_properties_and_volume_when_switching_wallpapers() {
+        let mut state = State::default();
+        let (one, two) = (Path::new("/w/one"), Path::new("/w/two"));
+        state.set_wallpaper("DP-1", one, BTreeMap::new());
+        state.set_property("DP-1", one, "rain", json!(false));
+        state.set_volume("DP-1", one, 42);
+        state.set_wallpaper("DP-1", two, BTreeMap::new());
+        state.set_property("DP-1", two, "speed", json!(3));
+        assert_eq!(state.properties_for("DP-1", one, &BTreeMap::new())["rain"], json!(false));
+        assert_eq!(state.volume("DP-1", one), 42);
+        state.set_wallpaper("DP-1", one, BTreeMap::new());
+        assert_eq!(state.overrides("DP-1", one)["rain"], json!(false));
+        assert_eq!(state.volume("DP-1", one), 42);
+        state.set_wallpaper("DP-1", two, BTreeMap::new());
+        assert_eq!(state.overrides("DP-1", two)["speed"], json!(3));
+    }
+
+    #[test]
+    fn reset_clears_restored_values_but_not_other_wallpapers() {
+        let mut state = State::default();
+        let (one, two) = (Path::new("/w/one"), Path::new("/w/two"));
+        state.set_wallpaper("DP-1", one, BTreeMap::new());
+        state.set_property("DP-1", one, "rain", json!(false));
+        state.set_wallpaper("DP-1", two, BTreeMap::new());
+        state.set_property("DP-1", two, "speed", json!(4));
+        state.set_wallpaper("DP-1", one, BTreeMap::new());
+        state.clear_properties("DP-1", one);
+        state.set_wallpaper("DP-1", two, BTreeMap::new());
+        state.set_wallpaper("DP-1", one, BTreeMap::new());
+        assert!(state.overrides("DP-1", one).is_empty());
+        assert_eq!(state.overrides("DP-1", two)["speed"], json!(4));
+    }
+
+    #[test]
+    fn loads_legacy_output_only_state_and_retains_its_look() {
+        let dir = temp_dir("legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(&path, r#"{
+            "outputs": {"DP-1": {"wallpaper": "/w/legacy", "properties": {"x": 9}, "volume": 20}},
+            "last": {"wallpaper": "/w/legacy", "properties": {"x": 9}, "volume": 20}
+        }"#).unwrap();
+        let mut state = State::load(&path);
+        state.set_wallpaper("DP-1", Path::new("/w/other"), BTreeMap::new());
+        state.set_wallpaper("DP-1", Path::new("/w/legacy"), BTreeMap::new());
+        assert_eq!(state.overrides("DP-1", Path::new("/w/legacy"))["x"], json!(9));
+        assert_eq!(state.volume("DP-1", Path::new("/w/legacy")), 20);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

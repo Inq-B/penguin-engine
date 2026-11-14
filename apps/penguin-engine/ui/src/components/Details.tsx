@@ -1,6 +1,7 @@
 // The selected wallpaper: preview, facts, actions, properties and presets.
 import { open as pick } from "@tauri-apps/plugin-dialog";
 import {
+  ChevronDown,
   Copy,
   ExternalLink,
   FolderOpen,
@@ -8,6 +9,7 @@ import {
   Layers,
   Play,
   RotateCcw,
+  Search,
   Save,
   Share2,
   Trash2,
@@ -110,20 +112,102 @@ function ItemDetails({ item }: { item: Item }) {
   );
 }
 
+interface PropertySection {
+  key: string;
+  title: string;
+  items: Property[];
+}
+
+function propertySections(props: Property[]): PropertySection[] {
+  const sections: PropertySection[] = [{ key: "general", title: "General", items: [] }];
+  for (const p of props) {
+    if (p.type.toLowerCase() === "group") {
+      sections.push({ key: p.name, title: p.label.trim() || "Other", items: [] });
+    } else {
+      sections[sections.length - 1].items.push(p);
+    }
+  }
+  return sections.filter((section) => section.items.length > 0);
+}
+
 function Properties({ item, live }: { item: Item; live: string | null }) {
   const { itemId, props, values, visible, loading } = useProps();
   const out = useApp((s) => s.status?.outputs.find((o) => o.name === live));
+  const [search, setSearch] = useState("");
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const ours = itemId === item.id;
   const sound = !!out?.wallpaper?.sound;
+
+  useEffect(() => {
+    setSearch("");
+    setExpanded({});
+  }, [item.id]);
+
+  const sections = useMemo(() => propertySections(props), [props]);
+  const query = search.trim().toLocaleLowerCase();
+  const groups = sections.map((section) => ({
+    ...section,
+    items: section.items.filter((p) =>
+      (!p.condition || visible[p.name] !== false) &&
+      (!query || [p.label, p.name, section.title].some((word) => word.toLocaleLowerCase().includes(query))),
+    ),
+  })).filter((section) => section.items.length > 0);
+
+  const shown = groups.reduce((total, group) => total + group.items.length, 0);
+  const total = props.filter((p) => p.type.toLowerCase() !== "group").length;
+
   if (!ours || (!loading && props.length === 0 && !sound)) return null;
   return (
     <>
-      <SectionHead>Properties</SectionHead>
-      <div class="props">
-        {!live && props.length > 0 && <div class="hint" style={{ textAlign: "left" }}>Changes take effect when you apply the wallpaper.</div>}
-        {sound && live && <Volume output={live} volume={out?.wallpaper?.volume ?? 100} />}
-        {props.map((p) =>
-          p.condition && visible[p.name] === false ? null : <Field key={p.name} p={p} value={p.name in values ? values[p.name] : p.value} />,
+      <SectionHead>Wallpaper settings</SectionHead>
+      <div class="property-browser">
+        <div class="property-toolbar">
+          <label class="field property-search">
+            <Search size={14} class="muted" />
+            <input
+              value={search}
+              onInput={(e) => setSearch((e.target as HTMLInputElement).value)}
+              placeholder="Find a setting…"
+              aria-label="Search wallpaper settings"
+            />
+          </label>
+          <span class="property-count">{shown}/{total}</span>
+        </div>
+        {!live && props.length > 0 && (
+          <div class="property-message">Changes to this wallpaper will be applied when you select it.</div>
+        )}
+        {sound && live && <div class="property-card"><Volume output={live} volume={out?.wallpaper?.volume ?? 100} /></div>}
+        {groups.map((section, index) => {
+          const open = !!query || (expanded[section.key] ?? index === 0);
+          const controls = section.items.filter((p) => p.type.toLowerCase() !== "text").length;
+          return (
+            <section class="property-section" key={section.key}>
+              <button
+                class="property-section-head"
+                type="button"
+                aria-expanded={open}
+                onClick={() => setExpanded((before) => ({ ...before, [section.key]: !open }))}
+              >
+                <span class="property-section-title">{section.title}</span>
+                <span class="property-section-count">{controls} settings</span>
+                <ChevronDown size={14} class={open ? "property-chevron open" : "property-chevron"} />
+              </button>
+              {open && (
+                <div class="property-section-body">
+                  {section.items.map((p) => (
+                    <Field
+                      key={p.name}
+                      p={p}
+                      value={p.name in values ? values[p.name] : p.value}
+                    />
+                  ))}
+                </div>
+              )}
+            </section>
+          );
+        })}
+        {!loading && !groups.length && !sound && (
+          <div class="property-empty">No matching settings. Try a different search.</div>
         )}
       </div>
     </>
@@ -255,9 +339,14 @@ function Field({ p, value }: { p: Property; value: Value }) {
         </label>
       );
     case "text":
-      return <div class="prop note">{p.label}</div>;
+      return (
+        <details class="property-note">
+          <summary>{p.label.length > 100 ? p.label.slice(0, 100) + "…" : p.label}</summary>
+          <div class="property-note-body">{p.label}</div>
+        </details>
+      );
     case "group":
-      return <div class="prop-group">{p.label}</div>;
+      return null;
     case "file":
     case "scenetexture":
     case "directory": {

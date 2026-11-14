@@ -171,13 +171,52 @@ pub async fn properties(
         .ok_or("no properties in the reply")?,
         None => {
             let dir = dir.clone();
-            tauri::async_runtime::spawn_blocking(move || wpe_library::properties(&dir))
+            tauri::async_runtime::spawn_blocking(move || {
+                let mut infos = wpe_library::properties(&dir);
+                // Inactive wallpapers should still show their last saved look,
+                // not revert to project.json whenever the user switches away.
+                let saved = remembered_properties(&dir);
+                for property in &mut infos {
+                    if let Some(value) = saved.get(&property.name) {
+                        property.value = value.clone();
+                    }
+                }
+                infos
+            })
                 .await
                 .map_err(|e| e.to_string())?
         }
     };
     let properties = labelled(&loaded.locale, &dir, infos);
     Ok(Properties { output, properties })
+}
+
+/// Read the daemon's atomically saved per-wallpaper values for inactive
+/// wallpapers. Legacy state files are also supported until the daemon migrates
+/// them. This is read-only: the daemon remains the sole writer of state.json.
+fn remembered_properties(dir: &std::path::Path) -> HashMap<String, Value> {
+    let Some(path) = dirs::state_dir()
+        .map(|dir| dir.join(wpe_library::APP_DIR).join("state.json")) else {
+        return HashMap::new();
+    };
+    let Ok(raw) = std::fs::read(path) else { return HashMap::new() };
+    let Ok(state) = serde_json::from_slice::<Value>(&raw) else {
+        return HashMap::new();
+    };
+    let key = dir.to_string_lossy();
+    let exact = state.get("wallpapers")
+        .and_then(|wallpapers| wallpapers.get(key.as_ref()))
+        .and_then(|wallpaper| wallpaper.get("properties"));
+    let legacy = || {
+        let outputs = state.get("outputs")?.as_object()?;
+        outputs.values().chain(state.get("last")).find(|entry| {
+            entry.get("wallpaper").and_then(Value::as_str) == Some(key.as_ref())
+        }).and_then(|entry| entry.get("properties"))
+    };
+    exact.or_else(legacy)
+        .and_then(Value::as_object)
+        .map(|props| props.iter().map(|(name, value)| (name.clone(), value.clone())).collect())
+        .unwrap_or_default()
 }
 
 fn labelled(locale: &Locale, dir: &std::path::Path, infos: Vec<PropertyInfo>) -> Vec<Property> {

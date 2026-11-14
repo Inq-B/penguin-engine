@@ -178,11 +178,11 @@ input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
 
 /* Details */
 .details {
-  width: 330px; flex: none; background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto;
+  width: clamp(350px, 31vw, 455px); flex: none; background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto;
   padding: 16px 18px 18px; display: flex; flex-direction: column; gap: 14px;
 }
 .preview {
-  position: relative; width: 100%; aspect-ratio: 1 / 1; border-radius: 10px; overflow: hidden; flex: none;
+  position: relative; width: 100%; aspect-ratio: 16 / 10; border-radius: 10px; overflow: hidden; flex: none;
   background: var(--field); box-shadow: inset 0 0 80px rgba(0, 0, 0, .35);
 }
 .preview img { width: 100%; height: 100%; object-fit: cover; display: block; }
@@ -328,3 +328,59 @@ input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
   padding: 8px 12px; border-radius: 6px; flex: none; color: var(--text-2);
   background: var(--panel); border: 1px solid var(--line); font-size: 12px;
 }
+
+/* Compact and searchable Wallpaper Engine property inspector. */
+.property-browser { display: flex; flex-direction: column; gap: 10px; }
+.property-toolbar { display: flex; gap: 8px; align-items: center; }
+.property-search { min-width: 0; flex: 1; height: 32px; }
+.property-search input { font-size: 12.5px; }
+.property-count { color: var(--muted); white-space: nowrap; font: 11px var(--mono); }
+.property-message {
+  font-size: 12px; line-height: 1.5; color: var(--text-2);
+  background: var(--accent-soft); border-radius: 6px; padding: 9px 11px;
+}
+.property-card {
+  padding: 12px; background: var(--field); border: 1px solid var(--field-line);
+  border-radius: 8px;
+}
+.property-section {
+  border: 1px solid var(--field-line); background: var(--field);
+  border-radius: 8px; overflow: hidden;
+}
+.property-section-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  border: 0; color: var(--text); background: transparent;
+  padding: 12px; text-align: left;
+}
+.property-section-head:hover { background: var(--hover); }
+.property-section-title { flex: 1; font-size: 12.5px; font-weight: 600; overflow-wrap: anywhere; }
+.property-section-count { font: 10px var(--mono); white-space: nowrap; color: var(--muted); }
+.property-chevron { flex: none; transform: rotate(-90deg); transition: transform 140ms ease; color: var(--muted); }
+.property-chevron.open { transform: rotate(0deg); }
+.property-section-body {
+  border-top: 1px solid var(--field-line); padding: 12px;
+  display: flex; flex-direction: column; gap: 13px;
+}
+.property-section-body .prop {
+  min-width: 0; padding-bottom: 12px; border-bottom: 1px solid var(--line-2);
+  overflow-wrap: anywhere;
+}
+.property-section-body .prop:last-child { border-bottom: none; padding-bottom: 0; }
+.property-section-body .prop.inline > span { flex: 1; min-width: 0; }
+.property-section-body .prop .head > span:first-child { min-width: 0; flex: 1; }
+.property-section-body select.field { width: 100%; min-width: 0; }
+.property-section-body input.field { min-width: 0; width: 100%; }
+.property-section-body .file { min-width: 0; flex-wrap: wrap; }
+.property-note { border-radius: 6px; color: var(--muted); }
+.property-note summary {
+  cursor: pointer; line-height: 1.5; overflow-wrap: anywhere;
+  list-style: none; font-size: 11.5px; padding: 6px 0;
+}
+.property-note summary::before { content: "▸"; color: var(--accent); margin-right: 6px; }
+.property-note[open] summary::before { content: "▾"; }
+.property-note-body {
+  max-height: 230px; overflow-y: auto; white-space: pre-wrap;
+  overflow-wrap: anywhere; line-height: 1.6; padding: 9px 10px;
+  font-size: 11.5px; background: var(--panel); border-radius: 6px;
+}
+.property-empty { padding: 18px; color: var(--muted); text-align: center; font-size: 12px; }

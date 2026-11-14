@@ -33,11 +33,15 @@ export const useProps = create<PropsState>()((set, get) => {
   const send = (name: string, value: Value) => {
     const output = get().output;
     if (!output) return;
+    const current = generation;
     inflight.add(name);
     api
       .daemon({ cmd: "property", output, name, value })
       .catch((e) => console.warn(`setting ${name}: ${e}`))
       .finally(() => {
+        // A reply to the previous wallpaper must not replay a queued slider
+        // change on whichever wallpaper was selected in the meantime.
+        if (current !== generation || get().output !== output) return;
         inflight.delete(name);
         if (queued.has(name)) {
           const next = queued.get(name)!;

@@ -345,6 +345,8 @@ impl App {
     }
     fn load(&mut self, i: usize, path: PathBuf, properties: BTreeMap<String,serde_json::Value>) -> Result<()> {
         let item = preset::resolve(&path).map_err(anyhow::Error::msg)?;
+        let name = self.screens[i].monitor.name.clone();
+        let properties = self.state.properties_for(&name, &path, &properties);
         let values = item.properties(&properties);
         let format = self.screens[i].config.format;
         let mut wallpaper = Wallpaper::load_with_properties(&self.gpu, format, &self.assets, &item.load, &values)?;

@@ -399,7 +399,7 @@ impl App {
                 output,
                 name,
                 path: path.clone(),
-                properties: properties.clone(),
+                properties: self.state.properties_for(&name, &path, &properties),
                 fill,
                 request: Some(request.clone()),
                 remember: true,
