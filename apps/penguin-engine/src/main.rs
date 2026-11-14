@@ -39,6 +39,7 @@ fn main() {
             commands::ui_state,
             commands::save_ui_state,
             commands::open_workshop,
+            commands::browse_workshop,
             commands::open_folder,
         ])
         .setup(|app| {

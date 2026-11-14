@@ -14,3 +14,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y libx11-dev libxext-dev libegl-dev libgles-dev libgl-dev libxkbcommon-dev libwayland-dev libpulse-dev libasound2-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libclang-dev pkg-config cmake nasm
       - run: cargo check --locked -p penguind --no-default-features --bins
+      - run: cargo test --locked -p wpe-library --lib
+
+  frontend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: corepack enable
+      - run: corepack prepare pnpm@10 --activate
+      - run: pnpm -C apps/penguin-engine/ui install --frozen-lockfile
+      - run: pnpm -C apps/penguin-engine/ui build

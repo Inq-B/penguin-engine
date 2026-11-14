@@ -157,6 +157,31 @@ export function refreshProps() {
   useProps.getState().load(item ?? null, liveOutput(item));
 }
 
+let libraryRefresh: Promise<number> | null = null;
+
+/** Re-index Steam downloads and keep the current selection and filters. */
+export function refreshLibrary(): Promise<number> {
+  if (libraryRefresh) return libraryRefresh;
+  const known = new Set(get().items.map((item) => item.id));
+  libraryRefresh = (async () => {
+    const [items, folders] = await Promise.all([
+      api.library(true),
+      api.folders().catch(() => get().folders),
+    ]);
+    const added = items.filter((item) => !known.has(item.id)).length;
+    const changed = added > 0 || items.length !== known.size;
+    set({ items, byId: new Map(items.map((item) => [item.id, item])), folders });
+    if (get().selected && !get().byId.has(get().selected!)) set({ selected: null });
+    refreshProps();
+    if (changed) {
+      const resolutions = await api.resolutions().catch(() => get().resolutions);
+      set({ resolutions });
+    }
+    return added;
+  })().finally(() => { libraryRefresh = null; });
+  return libraryRefresh;
+}
+
 /** Put the outputs back as they were when the app opened. */
 export async function revert() {
   const { snapshot, status } = get();

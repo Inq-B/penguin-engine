@@ -21,7 +21,7 @@ use wpe_library::{Item, Sources, steam};
 #[derive(Default)]
 pub struct Library(
     RwLock<Option<Arc<Loaded>>>,
-    tokio::sync::OnceCell<Arc<Resolutions>>,
+    RwLock<Option<Arc<Resolutions>>>,
 );
 
 /// Wallpaper sizes by item id, for those whose size is known.
@@ -57,6 +57,10 @@ impl Library {
             .await
             .expect("scanning the library");
         *slot = Some(loaded.clone());
+        if refresh {
+            // Installed Workshop items may have changed since the last scan.
+            *self.1.write().await = None;
+        }
         loaded
     }
 }
@@ -213,25 +217,30 @@ pub fn conditions(
 /// each wallpaper's files once (a second or two), then answers at once.
 #[tauri::command]
 pub async fn resolutions(state: State<'_, Library>) -> Result<Arc<Resolutions>, String> {
+    // Load the library before locking the resolution cache: the refresh path
+    // takes the locks in that order too.
     let loaded = state.loaded(false).await;
-    let sizes = state
-        .1
-        .get_or_init(|| async move {
-            tauri::async_runtime::spawn_blocking(move || {
-                use rayon::prelude::*;
-                Arc::new(
-                    loaded
-                        .items
-                        .par_iter()
-                        .filter_map(|item| Some((item.id.clone(), wpe_library::resolution(item)?)))
-                        .collect(),
-                )
-            })
-            .await
-            .expect("measuring wallpapers")
-        })
-        .await;
-    Ok(sizes.clone())
+    if let Some(sizes) = state.1.read().await.as_ref() {
+        return Ok(sizes.clone());
+    }
+    let mut slot = state.1.write().await;
+    if let Some(sizes) = slot.as_ref() {
+        return Ok(sizes.clone());
+    }
+    let sizes = tauri::async_runtime::spawn_blocking(move || {
+        use rayon::prelude::*;
+        Arc::new(
+            loaded
+                .items
+                .par_iter()
+                .filter_map(|item| Some((item.id.clone(), wpe_library::resolution(item)?)))
+                .collect::<Resolutions>(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    *slot = Some(sizes.clone());
+    Ok(sizes)
 }
 
 /// A wallpaper's size in pixels, if known (reads its files).
@@ -356,6 +365,35 @@ pub fn save_ui_state(state: Value) -> Result<(), String> {
             std::fs::write(&tmp, json)?;
             std::fs::rename(&tmp, &path)
         })
+        .map_err(|e| e.to_string())
+}
+
+/// Browse the official Steam Workshop site. Steam handles sign-in,
+/// subscriptions and downloads; the library scanner picks up installed files.
+#[tauri::command]
+pub fn browse_workshop(app: AppHandle, search: String, sort: String) -> Result<(), String> {
+    if search.chars().count() > 256 {
+        return Err("Workshop search is too long".into());
+    }
+    let sort = match sort.as_str() {
+        "mostrecent" => "mostrecent",
+        "mostpopular" => "mostpopular",
+        "toprated" => "toprated",
+        _ => "trend",
+    };
+    let mut url = url::Url::parse("https://steamcommunity.com/workshop/browse/")
+        .map_err(|e| e.to_string())?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("appid", wpe_library::steam::APP_ID);
+        pairs.append_pair("section", "readytouseitems");
+        pairs.append_pair("browsesort", sort);
+        if !search.trim().is_empty() {
+            pairs.append_pair("searchtext", search.trim());
+        }
+    }
+    app.opener()
+        .open_url(url.as_str(), None::<&str>)
         .map_err(|e| e.to_string())
 }
 

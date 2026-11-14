@@ -193,6 +193,7 @@ export const api = {
   uiState: () => invoke<unknown>("ui_state"),
   saveUiState: (state: unknown) => invoke<void>("save_ui_state", { state }),
   openWorkshop: (id: string) => invoke<void>("open_workshop", { id }),
+  browseWorkshop: (search: string, sort: string) => invoke<void>("browse_workshop", { search, sort }),
   openFolder: (id: string) => invoke<void>("open_folder", { id }),
 };
 

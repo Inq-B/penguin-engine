@@ -35,7 +35,8 @@ Errors reject with a message string.
 | `delete_preset` | `{id, name}` | |
 | `ui_state` | | What `save_ui_state` stored (null at first). |
 | `save_ui_state` | `{state}` | Any JSON (search, filters, selection, sizes). |
-| `open_workshop` | `{id}` | Opens the Steam page (workshop items). |
+| `open_workshop` | `{id}` | Opens a Steam item page for subscribing. |
+| `browse_workshop` | `{search, sort}` | Opens the official Wallpaper Engine Workshop, with an optional search (`trend`, `mostrecent`, `mostpopular`, or `toprated`). |
 | `open_folder` | `{id}` | Opens the wallpaper's directory. |
 
 `Item`: `{id, path, title, description, kind: "scene"|"video"|"web"|"application"|"preset"|"unknown", tags: string[], rating: "everyone"|"questionable"|"mature"|"unknown", preview, size (bytes), updated, installed (unix seconds or null), workshop_id, source: "workshop"|"projects"|"user", audio_reactive, has_properties, dependency}`.
@@ -63,3 +64,5 @@ Ask `daemon({request: {cmd: "status"}})` at start too, in case the first event c
   flight only remember the newest value; send that when the reply comes.
 - Load `preview://` (animated GIFs) for the hovered tile and the detail
   panel only.
+
+Workshop downloads are managed by Steam, not by the app. The UI calls `library({refresh: true})` after users return from Steam; this reindexes newly installed items (including secondary Steam libraries) and invalidates cached resolutions.

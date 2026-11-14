@@ -1,7 +1,9 @@
 import { open as pick } from "@tauri-apps/plugin-dialog";
+import { useEffect } from "preact/hooks";
 import { Check, Compass, HardDrive, Monitor, Package, Settings, Upload } from "lucide-preact";
-import { useApp, closeWindow, revert, request, toast, apply, targetLabel, type Tab } from "./store";
+import { useApp, closeWindow, revert, request, toast, apply, targetLabel, refreshLibrary, type Tab } from "./store";
 import { Browse } from "./components/Browse";
+import { SteamWorkshop } from "./components/SteamWorkshop";
 import { Details } from "./components/Details";
 import { SettingsDialog } from "./components/Settings";
 import { TitleBar } from "./components/TitleBar";
@@ -33,6 +35,16 @@ async function cancel() {
 }
 
 export function App() {
+  useEffect(() => {
+    let lastScan = 0;
+    const onFocus = () => {
+      if (useApp.getState().loading || Date.now() - lastScan < 10_000) return;
+      lastScan = Date.now();
+      void refreshLibrary().catch((e) => toast(String(e), true));
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
   const tab = useApp((s) => s.tab);
   const panelOpen = useApp((s) => s.panelOpen);
   const modal = useApp((s) => s.modal);
@@ -68,15 +80,7 @@ export function App() {
               <span class="grow">Not connected: {daemonDown}. Wallpapers can't be applied until it runs.</span>
             </div>
           )}
-          {tab === "library" ? (
-            <Browse />
-          ) : (
-            <div class="coming">
-              {tab === "discover" ? <Compass size={30} /> : <Package size={30} />}
-              <div class="what">{tab === "discover" ? "Discover" : "Workshop"} isn't here yet</div>
-              <div>Browsing the Steam Workshop comes later. Wallpapers you subscribe to in Steam show up in the Library.</div>
-            </div>
-          )}
+          {tab === "library" ? <Browse /> : <SteamWorkshop mode={tab} />}
           <div class="actions">
             <button class="btn big wide" onClick={openWallpaper}>
               <Upload size={14} />

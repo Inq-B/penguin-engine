@@ -148,6 +148,17 @@ cargo run --release -p scene-viewer -- <wallpaper> --audio --fps 30 --stats
 The assets directory is found automatically for common Steam installs; pass `--assets` otherwise.
 Set `WPE_DUMP_SHADERS=<dir>` to dump the final GLSL of every compiled shader.
 
+### Steam Workshop integration
+
+The GUI's **Discover** tab searches the official Steam Workshop site. Steam
+handles sign-in, subscriptions, and downloads; Penguin Engine never needs
+Steam credentials or an API key. The **Workshop** tab shows installed Workshop
+wallpapers and supports refresh/search/apply. Returning to the app refreshes
+the local library, including alternate drives configured in Steam's
+`steamapps/libraryfolders.vdf`. Steam must finish downloading a subscription
+before it appears in the GUI. This is a Steam-mediated workflow rather than
+an embedded remote Workshop catalogue.
+
 ### Web wallpapers
 
 A web wallpaper's directory is served at `http://<workshop id>.wallpaper.localhost/` (its own

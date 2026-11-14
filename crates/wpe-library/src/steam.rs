@@ -1,6 +1,7 @@
 //! Finding Wallpaper Engine's files in a Steam install: the stock assets and
 //! the workshop wallpapers.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Wallpaper Engine's Steam app id; workshop items live under this.
@@ -14,22 +15,66 @@ pub const STEAM_ROOTS: [&str; 3] = [
     ".var/app/com.valvesoftware.Steam/.local/share/Steam",
 ];
 
-/// `relative` under each Steam root, where it exists.
+/// Steam's `libraryfolders.vdf` accepts both the modern indexed blocks and
+/// the old numeric string entries.
+fn parse_library_folders(text: &str) -> Vec<PathBuf> {
+    let document = crate::acf::parse(text);
+    let Some(section) = document.get("libraryfolders") else {
+        return Vec::new();
+    };
+    section
+        .entries()
+        .iter()
+        .filter_map(|(index, entry)| {
+            index.parse::<u32>().ok()?;
+            entry
+                .as_str()
+                .or_else(|| entry.get("path").and_then(|v| v.as_str()))
+                .map(PathBuf::from)
+        })
+        .collect()
+}
+
+/// Installed Steam library roots, including libraries on other drives.
+fn steam_libraries_from(home: &Path) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    for relative in STEAM_ROOTS {
+        let root = home.join(relative);
+        if !root.is_dir() {
+            continue;
+        }
+        let mut candidates = vec![root.clone()];
+        if let Ok(text) = std::fs::read_to_string(root.join("steamapps/libraryfolders.vdf")) {
+            candidates.extend(parse_library_folders(&text));
+        }
+        for candidate in candidates {
+            if !candidate.is_dir() {
+                continue;
+            }
+            let canonical = candidate.canonicalize().unwrap_or_else(|_| candidate.clone());
+            if seen.insert(canonical) {
+                result.push(candidate);
+            }
+        }
+    }
+    result
+}
+
+/// `relative` under every installed Steam library, where it exists.
 fn steam_paths(relative: &str) -> Vec<PathBuf> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
-    STEAM_ROOTS
+    steam_libraries_from(&home)
         .into_iter()
-        .map(|root| home.join(root).join(relative))
-        .filter(|p| p.exists())
+        .map(|root| root.join(relative))
+        .filter(|path| path.exists())
         .collect()
 }
 
 fn steam_dirs(relative: &str) -> Vec<PathBuf> {
-    let mut dirs = steam_paths(relative);
-    dirs.retain(|p| p.is_dir());
-    dirs
+    steam_paths(relative).into_iter().filter(|p| p.is_dir()).collect()
 }
 
 /// Wallpaper Engine's install directory (`steamapps/common/wallpaper_engine`).
@@ -116,6 +161,27 @@ pub fn workshop_id(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovers_multiple_steam_libraries() {
+        let home = tempfile::tempdir().unwrap();
+        let primary = home.path().join(STEAM_ROOTS[0]);
+        let secondary = home.path().join("ExternalDrive/SteamLibrary");
+        std::fs::create_dir_all(primary.join("steamapps")).unwrap();
+        std::fs::create_dir_all(&secondary).unwrap();
+        std::fs::write(
+            primary.join("steamapps/libraryfolders.vdf"),
+            format!(
+                "\"libraryfolders\" {{ \"0\" {{ \"path\" \"{}\" }} \"1\" {{ \"path\" \"{}\" }} \"2\" \"{}\" }}",
+                primary.display(), secondary.display(), secondary.display()
+            ),
+        )
+        .unwrap();
+        let result = steam_libraries_from(home.path());
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], primary);
+        assert_eq!(result[1], secondary);
+    }
 
     #[test]
     fn resolves_paths_and_ids() {
