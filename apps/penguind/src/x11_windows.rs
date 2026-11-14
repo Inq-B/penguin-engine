@@ -13,6 +13,8 @@ unsafe extern "C" {
         width:*mut u32,height:*mut u32,border:*mut u32,depth:*mut u32)->c_int;
     fn XTranslateCoordinates(d:*mut c_void,src:c_ulong,dest:c_ulong,src_x:c_int,src_y:c_int,
         dest_x:*mut c_int,dest_y:*mut c_int,child:*mut c_ulong)->c_int;
+    fn XQueryTree(d:*mut c_void,w:c_ulong,root:*mut c_ulong,parent:*mut c_ulong,
+        children:*mut *mut c_ulong,count:*mut u32)->c_int;
 }
 fn atom(d:*mut c_void,n:&'static [u8])->c_ulong {
     unsafe { XInternAtom(d,n.as_ptr().cast(),0) }
@@ -48,18 +50,34 @@ pub fn is_desktop(d: *mut c_void, window: c_ulong) -> bool {
     if window == 0 {
         return true; // Uncovered root window.
     }
-    let kind = atom(d, b"_NET_WM_WINDOW_TYPE\0");
-    let desktop = atom(d, b"_NET_WM_WINDOW_TYPE_DESKTOP\0");
-    if numbers(d, window, kind).contains(&desktop) {
-        return true;
+    let kind = atom(d, b"_NET_WM_WINDOW_TYPE_DESKTOP\0");
+    let type_property=atom(d,b"_NET_WM_WINDOW_TYPE\0");
+    let class_property=atom(d,b"WM_CLASS\0");
+    // XQueryPointer(root) reports the direct child under the pointer.
+    // Some X11 desktop managers reparent their icon canvas, so inspect
+    // the parent chain (bounded and cached by the caller) rather than only
+    // the leaf's WM_CLASS.
+    let mut current=window;
+    for _ in 0..12 {
+        if numbers(d,current,type_property).contains(&kind) {
+            return true;
+        }
+        let class=text(d,current,class_property).to_lowercase();
+        if class.contains("nemo-desktop") || class.contains("xfdesktop")
+            || class.contains("pcmanfm") || class.contains("plasmashell") {
+            return true;
+        }
+        let (mut root,mut parent,mut children,mut count)=
+            (0,0,std::ptr::null_mut(),0);
+        let ok=unsafe {XQueryTree(d,current,&mut root,&mut parent,&mut children,&mut count)};
+        if !children.is_null() {
+            unsafe {XFree(children.cast());}
+        }
+        if ok==0 || parent==0 || parent==root || parent==current { break; }
+        current=parent;
     }
-    // Some desktop managers omit the EWMH type on their icon surface.
-    let class = text(d, window, atom(d, b"WM_CLASS\0")).to_lowercase();
-    class.contains("nemo-desktop") || class.contains("nemo-desktop-window")
-        || class.contains("xfdesktop") || class.contains("pcmanfm")
-        || class.contains("plasmashell")
+    false
 }
-
 /// Other applications' windows and their EWMH states. This works with EWMH
 /// window managers (Muffin, KWin X11, Xfwm, Openbox and most others).
 pub fn list(d:*mut c_void,root:c_ulong,outputs:&[(String,(i32,i32,u32,u32))])->Vec<WindowInfo>{
