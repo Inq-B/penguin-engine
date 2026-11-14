@@ -732,9 +732,12 @@ fn main()->Result<()> {
             for s in &mut app.screens {
                 if pointer_ok {
                     if let Some(w)=&mut s.wallpaper {
-                        w.set_pointer(glam::Vec2::new(
-                            (rx-s.monitor.x) as f32/s.monitor.width.max(1) as f32,
-                            (ry-s.monitor.y) as f32/s.monitor.height.max(1) as f32));
+                        // Keep coordinates bounded: when the pointer is
+                        // moving on another monitor, don't generate continuous
+                        // out-of-bounds Servo mouse events for this one.
+                        let x=((rx-s.monitor.x) as f32/s.monitor.width.max(1) as f32).clamp(0.0,1.0);
+                        let y=((ry-s.monitor.y) as f32/s.monitor.height.max(1) as f32).clamp(0.0,1.0);
+                        w.set_pointer(glam::Vec2::new(x,y));
                     }
                 }
                 s.render(&app.gpu,app.settings.fps,args.stats);
