@@ -216,7 +216,12 @@ impl Screen {
         // Preserve a stricter per-output rule if one is active.
         let requested = if fps_cap == 0 { 60 } else { fps_cap };
         let cap = self.held.fps.map_or(requested, |rule| rule.min(requested)).max(1);
-        if self.last_render.elapsed() < Duration::from_secs_f64(1.0 / cap as f64) { return; }
+        // The outer loop already schedules frames. Comparing against the
+        // *end* of the previous frame (and requiring an exact full period)
+        // caused 60 Hz scenes to skip every other frame under ordinary render
+        // load. Keep a small scheduling tolerance for per-output rule caps.
+        let period=Duration::from_secs_f64(1.0 / cap as f64);
+        if self.last_render.elapsed().saturating_add(Duration::from_millis(2)) < period { return; }
         let Some(wallpaper) = self.wallpaper.as_mut() else { return; };
         let cpu_start=Instant::now();
         let frame = match self.surface.get_current_texture() {
@@ -236,7 +241,8 @@ impl Screen {
         let spent=cpu_start.elapsed();
         self.render_time+=spent;
         self.render_max=self.render_max.max(spent);
-        self.last_render = Instant::now();
+        // Frame intervals are measured from their start, not present time.
+        self.last_render = cpu_start;
         self.frames += 1;
         let elapsed = self.sampled.elapsed();
         if elapsed >= Duration::from_secs(3) {
