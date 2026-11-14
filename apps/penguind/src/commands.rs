@@ -397,7 +397,7 @@ impl App {
                 .unwrap_or(self.settings.fill);
             let spec = LoadSpec {
                 output,
-                name,
+                name: name.clone(),
                 path: path.clone(),
                 properties: self.state.properties_for(&name, &path, &properties),
                 fill,

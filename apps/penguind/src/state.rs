@@ -215,13 +215,16 @@ impl State {
 
     /// Remember one property change on the current output and its wallpaper.
     pub fn set_property(&mut self, name: &str, wallpaper: &Path, property: &str, value: Value) {
-        self.entry(name, wallpaper).properties.insert(property.to_owned(), value.clone());
-        self.wallpapers.entry(wallpaper.to_owned()).or_default()
-            .properties.insert(property.to_owned(), value);
+        let properties = {
+            let entry = self.entry(name, wallpaper);
+            entry.properties.insert(property.to_owned(), value);
+            entry.properties.clone()
+        };
+        self.wallpapers.entry(wallpaper.to_owned()).or_default().properties = properties.clone();
         if let Some(last) = &mut self.last
             && last.wallpaper == wallpaper
         {
-            last.properties.insert(property.to_owned(), self.wallpapers[wallpaper].properties[property].clone());
+            last.properties = properties;
         }
     }
 
@@ -268,7 +271,11 @@ impl State {
     /// Ensure an output entry points to the currently playing wallpaper.
     fn entry(&mut self, name: &str, wallpaper: &Path) -> &mut SavedOutput {
         if self.outputs.get(name).is_none_or(|s| s.wallpaper != wallpaper) {
-            let remembered = self.remembered(wallpaper);
+            let mut remembered = self.remembered(wallpaper);
+            if let Some(last) = self.last.as_ref().filter(|s| s.wallpaper == wallpaper) {
+                remembered.properties.extend(last.properties.clone());
+                remembered.volume = last.volume.or(remembered.volume);
+            }
             let fill = self.outputs.get(name).and_then(|s| s.fill);
             self.outputs.insert(name.to_owned(), SavedOutput {
                 wallpaper: wallpaper.to_owned(),

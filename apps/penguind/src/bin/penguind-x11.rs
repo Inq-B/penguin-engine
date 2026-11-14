@@ -206,13 +206,19 @@ struct Screen {
     frames: u32,
     fps: f32,
     sampled: Instant,
+    render_time: Duration,
+    render_max: Duration,
 }
 impl Screen {
     fn render(&mut self, gpu: &Gpu, fps_cap: u32, stats: bool) {
         if self.paused || self.held.playback >= wpe_ipc::Playback::Pause { return; }
-        let cap = self.held.fps.map_or(fps_cap, |rule| if fps_cap == 0 { rule } else { rule.min(fps_cap) }).max(1);
+        // The X11 loop uses 60 Hz when the general cap is unspecified.
+        // Preserve a stricter per-output rule if one is active.
+        let requested = if fps_cap == 0 { 60 } else { fps_cap };
+        let cap = self.held.fps.map_or(requested, |rule| rule.min(requested)).max(1);
         if self.last_render.elapsed() < Duration::from_secs_f64(1.0 / cap as f64) { return; }
         let Some(wallpaper) = self.wallpaper.as_mut() else { return; };
+        let cpu_start=Instant::now();
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) |
             wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -227,14 +233,24 @@ impl Screen {
         wallpaper.render(gpu, &mut encoder, &view, (self.config.width,self.config.height));
         gpu.queue.submit([encoder.finish()]);
         gpu.queue.present(frame);
+        let spent=cpu_start.elapsed();
+        self.render_time+=spent;
+        self.render_max=self.render_max.max(spent);
         self.last_render = Instant::now();
         self.frames += 1;
         let elapsed = self.sampled.elapsed();
         if elapsed >= Duration::from_secs(3) {
             self.fps = self.frames as f32 / elapsed.as_secs_f32();
-            self.frames = 0;
-            self.sampled = Instant::now();
-            if stats { tracing::info!("{}: {:.1} fps (cap {})", self.monitor.name, self.fps, fps_cap); }
+            if stats {
+                tracing::info!("{}: {:.1} fps (cap {}), CPU render+present avg {:.2}ms, max {:.2}ms",
+                    self.monitor.name,self.fps,cap,
+                    self.render_time.as_secs_f64()*1000.0/(self.frames.max(1) as f64),
+                    self.render_max.as_secs_f64()*1000.0);
+            }
+            self.render_time=Duration::ZERO;
+            self.render_max=Duration::ZERO;
+            self.frames=0;
+            self.sampled=Instant::now();
         }
     }
 }
@@ -316,9 +332,11 @@ impl App {
         self.apply_rules();
     }
     fn apply_rules(&mut self) {
+        let mut changed = false;
         for s in &mut self.screens {
             let limits = x11_rules::limits_for(&self.settings.rules, &self.signals, &s.monitor.name);
             if s.held == limits { continue; }
+            changed = true;
             tracing::info!("{}: X11 rules {:?} ({})", s.monitor.name, limits.playback, limits.because.join(", "));
             s.held = limits;
             if let Some(w) = &mut s.wallpaper {
@@ -330,7 +348,8 @@ impl App {
                 w.set_particle_density((self.settings.particles.min(100) as f32 / 100.0) * particles as f32 / 100.0);
             }
         }
-        self.publish();
+        // Don't flood the GUI with unchanged status every half-second.
+        if changed { self.publish(); }
     }
     fn publish(&mut self) {
         let json = serde_json::to_vec(&wpe_ipc::Event::Status { status: self.status() }).unwrap_or_default();
@@ -566,14 +585,18 @@ fn create_screen(display:&Display,instance:&wgpu::Instance,gpu:Option<&Gpu>,m:Mo
         .context("X11 surface incompatible with the GPU")?;
     if let Some(format)=caps.formats.iter().find(|f|!f.is_srgb()) {config.format=*format;}
     if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque){config.alpha_mode=wgpu::CompositeAlphaMode::Opaque;}
-    config.present_mode=if caps.present_modes.contains(&wgpu::PresentMode::Mailbox){
-        wgpu::PresentMode::Mailbox
-    }else{wgpu::PresentMode::Fifo};
+    // FIFO prevents mailbox from rendering a fresh full-screen GPU frame
+    // while one or more frames are still waiting in the compositor.
+    // Interactive pages benefit from predictable frame pacing over
+    // throughput of frames that will never be presented.
+    config.present_mode=wgpu::PresentMode::Fifo;
+    config.desired_maximum_frame_latency=2;
     surface.configure(&gpu.device,&config);
     Ok((Screen {
         monitor:m,win,surface,config,wallpaper:None,path:None,item:None,
         paused:false,held:wpe_ipc::Limits::default(),last_render:Instant::now()-Duration::from_secs(1),
         fill:Fill::Auto,frames:0,fps:0.0,sampled:Instant::now(),
+        render_time:Duration::ZERO,render_max:Duration::ZERO,
     },new_gpu))
 }
 fn main()->Result<()> {
@@ -693,21 +716,35 @@ fn main()->Result<()> {
         }
         let now=Instant::now();
         if now>=next_frame {
-            // Input is sampled through XQueryPointer so wallpaper cursor parallax
-            // works even on a click-through desktop.
+            // Query the pointer ONCE from the root instead of once per
+            // display, avoiding multiple synchronous X11 round trips for
+            // multi-monitor systems.
+            let (mut root,mut child,mut rx,mut ry,mut wx,mut wy,mut mask)=(0,0,0,0,0,0,0);
+            let root_window=unsafe {XRootWindow(app.display.0,app.display.1)};
+            let pointer_ok=unsafe {XQueryPointer(app.display.0,root_window,
+                &mut root,&mut child,&mut rx,&mut ry,&mut wx,&mut wy,&mut mask)} != 0;
             for s in &mut app.screens {
-                let (mut root,mut child,mut rx,mut ry,mut wx,mut wy,mut mask)=(0,0,0,0,0,0,0);
-                unsafe {XQueryPointer(app.display.0,s.win,&mut root,&mut child,&mut rx,&mut ry,&mut wx,&mut wy,&mut mask);}
-                if let Some(w)=&mut s.wallpaper {
-                    w.set_pointer(glam::Vec2::new(wx as f32/s.monitor.width.max(1) as f32,
-                        wy as f32/s.monitor.height.max(1) as f32));
+                if pointer_ok {
+                    if let Some(w)=&mut s.wallpaper {
+                        w.set_pointer(glam::Vec2::new(
+                            (rx-s.monitor.x) as f32/s.monitor.width.max(1) as f32,
+                            (ry-s.monitor.y) as f32/s.monitor.height.max(1) as f32));
+                    }
                 }
                 s.render(&app.gpu,app.settings.fps,args.stats);
             }
             let cap=if app.settings.fps==0 {60}else{app.settings.fps.max(1)};
-            next_frame=now+Duration::from_secs_f64(1.0/cap as f64);
+            let period=Duration::from_secs_f64(1.0/cap as f64);
+            // Anchor to the scheduled deadline; don't gradually lose time
+            // to the work needed to render a frame. Catch up without spinning
+            // after a large frame-time spike.
+            next_frame+=period;
+            if next_frame<=Instant::now() { next_frame=Instant::now()+period; }
         }
-        std::thread::sleep(Duration::from_millis(3));
+        // An adaptive wait reduces idle CPU wakeups (~333/s before), while
+        // keeping input and control commands responsive at up to 200 Hz.
+        let until=next_frame.saturating_duration_since(Instant::now());
+        std::thread::sleep(until.min(Duration::from_millis(5)));
     }
     app.subscribers.clear();
     app.peers.clear();
