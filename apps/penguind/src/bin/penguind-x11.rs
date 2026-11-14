@@ -372,6 +372,36 @@ impl App {
         self.hit_is_desktop
     }
 
+    /// Button state is sampled independently of the render loop. A quick
+    /// mouse click can start and finish between two 60 Hz frames; checking
+    /// at ~5 ms while interactive reduces those missed clicks. Click-through
+    /// mode never incurs this extra X server round trip.
+    fn poll_desktop_buttons(&mut self) {
+        if self.settings.passthrough { return; }
+        let root_window=unsafe {XRootWindow(self.display.0,self.display.1)};
+        let (mut root,mut child,mut rx,mut ry,mut wx,mut wy,mut mask)=(0,0,0,0,0,0,0);
+        if unsafe { XQueryPointer(self.display.0,root_window,
+            &mut root,&mut child,&mut rx,&mut ry,&mut wx,&mut wy,&mut mask) } == 0 {
+            return;
+        }
+        let desktop=self.desktop_hit(child);
+        for screen in &mut self.screens {
+            let inside=rx>=screen.monitor.x && ry>=screen.monitor.y
+                && i64::from(rx)<i64::from(screen.monitor.x)+i64::from(screen.monitor.width)
+                && i64::from(ry)<i64::from(screen.monitor.y)+i64::from(screen.monitor.height);
+            let wanted=if desktop && inside { mask & ((1<<8)|(1<<9)|(1<<10)) } else {0};
+            if screen.pressed != wanted {
+                if let Some(wallpaper)=screen.wallpaper.as_mut() {
+                    wallpaper.set_pointer(glam::Vec2::new(
+                        ((rx-screen.monitor.x) as f32 / screen.monitor.width.max(1) as f32).clamp(0.0,1.0),
+                        ((ry-screen.monitor.y) as f32 / screen.monitor.height.max(1) as f32).clamp(0.0,1.0),
+                    ));
+                }
+                screen.buttons(wanted);
+            }
+        }
+    }
+
     fn poll_input(&mut self) {
         unsafe {
             while XPending(self.display.0) > 0 {
@@ -830,6 +860,7 @@ fn main()->Result<()> {
     listener.set_nonblocking(true)?;
     let mut last_scan=Instant::now();
     let mut last_signals=Instant::now();
+    let mut last_buttons=Instant::now();
     let mut next_frame=Instant::now();
     tracing::info!("X11 backend active on {} outputs; control socket {}",app.screens.len(),socket_path.display());
     while !app.quit {
@@ -850,6 +881,10 @@ fn main()->Result<()> {
             app.state_dirty=false;
         }
         app.poll_input();
+        if !app.settings.passthrough && last_buttons.elapsed()>=Duration::from_millis(5) {
+            app.poll_desktop_buttons();
+            last_buttons=Instant::now();
+        }
         if last_signals.elapsed()>=Duration::from_millis(500) {
             app.poll_signals();
             last_signals=Instant::now();
