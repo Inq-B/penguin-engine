@@ -29,6 +29,7 @@ const inflight = new Set<string>();
 let generation = 0;
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 let sending = false;
+let activeSend: Promise<void> | null = null;
 
 function clearFlushTimer() {
   if (flushTimer !== null) {
@@ -40,7 +41,12 @@ function clearFlushTimer() {
 export const useProps = create<PropsState>()((set, get) => {
   const flush = async (): Promise<void> => {
     clearFlushTimer();
-    if (sending || !pending.size) return;
+    if (sending) {
+      await activeSend;
+      if (pending.size) await flush();
+      return;
+    }
+    if (!pending.size) return;
     const { outputs } = get();
     if (!outputs.length) {
       pending.clear();
@@ -53,17 +59,20 @@ export const useProps = create<PropsState>()((set, get) => {
     sending = true;
     keys.forEach((key) => inflight.add(key));
     try {
-      const replies = await Promise.allSettled(
+      activeSend = Promise.allSettled(
         outputs.map((output) => api.daemon({ cmd: "set-properties", output, values })),
-      );
-      for (const result of replies) {
-        if (result.status === "rejected") console.warn("setting wallpaper properties:", result.reason);
-      }
+      ).then((replies) => {
+        for (const result of replies) {
+          if (result.status === "rejected") console.warn("setting wallpaper properties:", result.reason);
+        }
+      });
+      await activeSend;
     } finally {
       if (generation === current) {
         keys.forEach((key) => inflight.delete(key));
       }
       sending = false;
+      activeSend = null;
       if (pending.size) schedule(0);
     }
   };
@@ -96,7 +105,7 @@ export const useProps = create<PropsState>()((set, get) => {
 
     load: async (item, output, outputs = output ? [output] : []) => {
       // A pending edit should reach its old wallpaper before switching away.
-      if (pending.size) await flush();
+      if (pending.size || sending) await flush();
       const current = ++generation;
       clearFlushTimer();
       pending.clear();

@@ -537,9 +537,7 @@ impl App {
             let screen = &mut self.screens[i];
             if changes.len() == 1 || screen.wallpaper.is_web() {
                 let started = Instant::now();
-                for (k, v) in &changes {
-                    screen.wallpaper.set_user_property(&gpu, k, v.clone());
-                }
+                screen.wallpaper.set_user_properties(&gpu, &changes);
                 screen.dirty = true;
                 tracing::info!(
                     "{name}: {} properties changed ({:.1?})",

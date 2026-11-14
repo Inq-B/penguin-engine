@@ -263,6 +263,9 @@ export async function start() {
     set(pick);
   }
   useApp.subscribe((s, prev) => {
+    // Changing the target monitor must immediately update the property editor's
+    // live output and broadcast recipients, not wait for another daemon event.
+    if (s.target !== prev.target) refreshProps();
     if (!SAVED_KEYS.some((k) => s[k] !== prev[k])) return;
     clearTimeout(saveTimer);
     saveTimer = window.setTimeout(() => {
