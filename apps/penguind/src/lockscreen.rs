@@ -126,8 +126,12 @@ pub fn save_png(frames:Vec<Frame>,path:&Path)->Result<(),String>{
     writer.finish().map_err(|e|e.to_string())?;
     std::fs::rename(tmp,path).map_err(|e|e.to_string())
 }
-pub fn snapshot_path()->Option<PathBuf>{
-    Some(dirs::cache_dir()?.join("penguin-engine").join("lockscreen.png"))
+/// Alternate snapshots so the picture URI actually changes after every
+/// capture. Cinnamon caches decoded backgrounds by URI; replacing an image
+/// in-place at the same URI can leave the lock screen showing an old frame.
+pub fn snapshot_path(slot:u8)->Option<PathBuf>{
+    Some(dirs::cache_dir()?.join("penguin-engine").join(format!("lockscreen-{}.png",
+        if slot & 1 == 0 {"a"}else{"b"})))
 }
 fn get(schema:&str,key:&str)->Option<String>{
     let out=Command::new("gsettings").args(["get",schema,key]).output().ok()?;
@@ -150,32 +154,109 @@ fn uri(path:&Path)->String{
 fn quoted(s:&str)->String{
     format!("'{}'",s.replace('\\',"\\\\").replace('\'',"\\'"))
 }
-pub struct CinnamonBackground{
-    old:Option<(String,String,String)>,image:String,
+/// A temporary override of Cinnamon's hidden desktop background. It must
+/// be installed *before* the screensaver Stage is constructed: Cinnamon
+/// chooses one monitor (spanned) or one view per monitor during setup.
+/// The snapshot becomes Cinnamon's fallback background while enabled.
+/// Keep its original settings on disk so a crashed daemon can restore them
+/// rather than accidentally adopting our snapshot as the user's wallpaper.
+fn backup_path()->Option<PathBuf>{
+    Some(dirs::state_dir()?.join("penguin-engine").join("cinnamon-lockscreen-backup.json"))
 }
-impl CinnamonBackground{
-    pub fn new(path:&Path)->Self{Self{old:None,image:quoted(&uri(path))}}
-    pub fn activate(&mut self,spanned:bool){
-        if self.old.is_some(){return;}
-        let (Some(previous),Some(options),Some(slideshow))=(
-            get(BG,"picture-uri"),get(BG,"picture-options"),
-            get(SLIDE,"slideshow-enabled"))else{
-            tracing::warn!("Cinnamon background GSettings schema unavailable");return;
-        };
-        self.old=Some((previous,options,slideshow));
-        let _=set(SLIDE,"slideshow-enabled","false");
-        let _=set(BG,"picture-options",if spanned{"spanned"}else{"zoom"});
-        if !set(BG,"picture-uri",&self.image){
-            tracing::warn!("failed to apply lock-screen image");
-            self.deactivate();
+fn read_backup()->Option<(String,String,String)>{
+    serde_json::from_slice(&std::fs::read(backup_path()?).ok()?).ok()
+}
+fn write_backup(value:&(String,String,String)){
+    if let Some(path)=backup_path(){
+        if let Some(dir)=path.parent(){let _=std::fs::create_dir_all(dir);}
+        if let Ok(json)=serde_json::to_vec(value){
+            if let Err(e)=std::fs::write(path,json){
+                tracing::warn!("saving Cinnamon background backup: {e}");
+            }
         }
     }
+}
+fn delete_backup(){if let Some(path)=backup_path(){let _=std::fs::remove_file(path);}}
+fn our_uri(uri:&str)->bool{
+    uri.contains("/penguin-engine/lockscreen-a.png")
+        || uri.contains("/penguin-engine/lockscreen-b.png")
+        || uri.contains("/penguin-engine/lockscreen.png")
+}
+/// A temporary override of Cinnamon's hidden desktop background. It must
+/// be installed *before* the screensaver Stage is constructed: Cinnamon
+/// chooses one monitor (spanned) or one view per monitor during setup.
+pub struct CinnamonBackground {
+    old: Option<(String,String,String)>,
+    image: Option<String>,
+}
+impl CinnamonBackground {
+    pub fn new()->Self {
+        let original=read_backup();
+        let current=get(BG,"picture-uri");
+        let owns_picture=current.as_deref().is_some_and(our_uri);
+        if original.is_some() && !owns_picture {
+            // The user changed their wallpaper while Penguin was not running.
+            // Never restore an outdated backup over their choice.
+            delete_backup();
+        }
+        Self{
+            old:if owns_picture{original}else{None},
+            image:if owns_picture{current}else{None},
+        }
+    }
+    pub fn next_slot(&self)->u8{
+        if self.image.as_deref().is_some_and(|s|s.contains("lockscreen-a.png")) {1}else{0}
+    }
+
+    /// Install the latest snapshot while the session is unlocked. Do not
+    /// re-read the original wallpaper on subsequent captures.
+    pub fn activate(&mut self,path:&Path,spanned:bool){
+        if self.old.is_none() {
+            let (Some(previous),Some(options),Some(slideshow))=(
+                get(BG,"picture-uri"),get(BG,"picture-options"),
+                get(SLIDE,"slideshow-enabled"))else{
+                tracing::warn!("Cinnamon background GSettings schema unavailable");
+                return;
+            };
+            let old=(previous,options,slideshow);
+            write_backup(&old);
+            self.old=Some(old);
+        }
+        let image=quoted(&uri(path));
+        let mode=if spanned{"spanned"}else{"zoom"};
+        if !set(SLIDE,"slideshow-enabled","false")
+            || !set(BG,"picture-options",mode)
+            || !set(BG,"picture-uri",&image)
+        {
+            tracing::warn!("cannot prepare Cinnamon lock-screen background");
+            // Best-effort restoration on a partial settings update.
+            if let Some((previous,options,slideshow))=self.old.take(){
+                let _=set(BG,"picture-uri",&previous);
+                let _=set(BG,"picture-options",&options);
+                let _=set(SLIDE,"slideshow-enabled",&slideshow);
+            }
+            self.image=None;
+            delete_backup();
+            return;
+        }
+        self.image=Some(image);
+    }
+
+    /// Restore only when the current URI still belongs to us, so a user
+    /// changing their Cinnamon wallpaper manually doesn't get overwritten.
     pub fn deactivate(&mut self){
-        let Some((previous,options,slideshow))=self.old.take()else{return;};
-        if get(BG,"picture-uri").as_deref()==Some(self.image.as_str()){
-            let _=set(BG,"picture-uri",&previous);
-            let _=set(BG,"picture-options",&options);
-            let _=set(SLIDE,"slideshow-enabled",&slideshow);
+        let old=self.old.take();
+        let ours=self.image.take();
+        let (Some((previous,options,slideshow)),Some(image))=(old,ours)else{return;};
+        if get(BG,"picture-uri").as_deref()==Some(image.as_str()){
+            let one=set(BG,"picture-uri",&previous);
+            let two=set(BG,"picture-options",&options);
+            let three=set(SLIDE,"slideshow-enabled",&slideshow);
+            if one&&two&&three {delete_backup();}
+            else {tracing::warn!("could not fully restore Cinnamon background");}
+        } else {
+            // The user selected another background; discard our old backup.
+            delete_backup();
         }
     }
 }

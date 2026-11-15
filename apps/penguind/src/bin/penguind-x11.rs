@@ -347,7 +347,10 @@ struct App {
     lock_snapshot_ready: bool,
     lock_capture_at: Instant,
     lock_capture: Option<lockscreen::Batch>,
-    lock_save: Option<std::sync::mpsc::Receiver<std::result::Result<(),String>>>,
+    lock_save: Option<std::sync::mpsc::Receiver<std::result::Result<PathBuf,String>>>,
+    lock_next_slot: u8,
+    lock_is_locked: bool,
+    lock_pending_path: Option<PathBuf>,
 }
 impl App {
     fn save(&self) {
@@ -576,6 +579,7 @@ impl App {
         if old_lock && !settings.lockscreen_snapshot {
             if let Some(lock)=&mut self.lock_bg {lock.deactivate();}
             self.lock_capture=None;
+            self.lock_pending_path=None;
             self.lock_snapshot_ready=false;
         }
         if !old_lock && settings.lockscreen_snapshot {
@@ -874,15 +878,20 @@ fn main()->Result<()> {
     let (sound_tx,sound_rx)=std::sync::mpsc::channel();
     x11_sound_watch::watch(sound_tx);
     let lock_rx=lockscreen::watch_cinnamon();
-    let lock_bg=lockscreen::snapshot_path().as_deref()
-        .map(lockscreen::CinnamonBackground::new);
+    let mut lock_bg=lockscreen::CinnamonBackground::new();
+    // Restore a stale override after an unclean exit if the setting was
+    // disabled in the meantime. Otherwise retain the original backup.
+    if !settings.lockscreen_snapshot { lock_bg.deactivate(); }
+    let next_slot=lock_bg.next_slot();
+    let lock_bg=Some(lock_bg);
     let mut app=App{display,gpu:gpu.context("no selected X11 output")?,screens,assets,
         state:saved,state_path:path,settings,signals:wpe_ipc::Signals::default(),sound_rx,
         peers:vec![],subscribers:vec![],quit:false,
         state_dirty:false,last_state_edit:Instant::now(),
         hit_window:0,hit_is_desktop:false,lock_rx,lock_bg,
         lock_snapshot_ready:false,lock_capture_at:Instant::now()-Duration::from_secs(120),
-        lock_capture:None,lock_save:None};
+        lock_capture:None,lock_save:None,lock_next_slot:next_slot,
+        lock_is_locked:false,lock_pending_path:None};
     for i in 0..app.screens.len() {
         let name=app.screens[i].monitor.name.clone();
         if let Some(saved)=app.state.for_output(&name).cloned() {
@@ -922,20 +931,38 @@ fn main()->Result<()> {
             app.state_dirty=false;
         }
         app.poll_input();
+        // Cinnamon determines SPANNED monitor geometry when its Stage is
+        // created. Updating GSettings after ActiveChanged is already too
+        // late: the two monitor views will each crop the combined PNG.
+        // Keep the snapshot selected while unlocked, hidden behind the live
+        // Penguin Engine wallpaper. Preserve the original background and
+        // restore it when the integration is disabled or the daemon exits.
         while let Ok(active)=app.lock_rx.try_recv() {
-            if active && app.settings.lockscreen_snapshot && app.lock_snapshot_ready {
-                if let (Some(bg),Some(path))=(&mut app.lock_bg,lockscreen::snapshot_path()) {
-                    if path.exists() { bg.activate(app.screens.len()>1 || app.settings.span); }
+            app.lock_is_locked=active;
+            if !active && app.settings.lockscreen_snapshot {
+                if let Some(path)=app.lock_pending_path.take() {
+                    if let Some(bg)=&mut app.lock_bg {
+                        bg.activate(&path,app.screens.len()>1 || app.settings.span);
+                    }
                 }
-            } else if !active {
-                if let Some(bg)=&mut app.lock_bg {bg.deactivate();}
             }
         }
         if let Some(receiver)=&app.lock_save {
             if let Ok(result)=receiver.try_recv() {
                 match result {
-                    Ok(())=>{app.lock_snapshot_ready=true;
-                        tracing::debug!("updated Cinnamon lock-screen snapshot");},
+                    Ok(path)=>{
+                        app.lock_snapshot_ready=true;
+                        app.lock_next_slot^=1;
+                        if app.settings.lockscreen_snapshot {
+                            if app.lock_is_locked {
+                                // Don't swap wallpapers mid-lock.
+                                app.lock_pending_path=Some(path);
+                            } else if let Some(bg)=&mut app.lock_bg {
+                                bg.activate(&path,app.screens.len()>1 || app.settings.span);
+                            }
+                        }
+                        tracing::debug!("prepared Cinnamon lock-screen snapshot");
+                    },
                     Err(e)=>tracing::warn!("lock-screen snapshot: {e}"),
                 }
                 app.lock_save=None;
@@ -946,10 +973,11 @@ fn main()->Result<()> {
             match result {
                 Ok(Some(frames))=>{
                     app.lock_capture=None;
-                    if let Some(path)=lockscreen::snapshot_path() {
+                    if let Some(path)=lockscreen::snapshot_path(app.lock_next_slot) {
                         let (tx,rx)=std::sync::mpsc::channel();
                         std::thread::spawn(move || {
-                            let _=tx.send(lockscreen::save_png(frames,&path));
+                            let result=lockscreen::save_png(frames,&path).map(|()|path);
+                            let _=tx.send(result);
                         });
                         app.lock_save=Some(rx);
                     }
