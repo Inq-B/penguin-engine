@@ -58,7 +58,8 @@ impl Capture {
             Err(TryRecvError::Disconnected)=>Err("GPU mapping callback disconnected".into()),
             Ok(Err(e))=>Err(format!("GPU readback failed: {e}")),
             Ok(Ok(()))=>{
-                let mapped=self.buffer.slice(..).get_mapped_range();
+                let mapped=self.buffer.slice(..).get_mapped_range()
+                    .map_err(|e|format!("reading lock-screen capture: {e}"))?;
                 let bytes=self.rect.width as usize*4;
                 let mut pixels=vec![0u8;bytes*self.rect.height as usize];
                 for (y,row) in mapped.chunks_exact(self.padded as usize).enumerate(){
