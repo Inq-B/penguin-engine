@@ -202,6 +202,14 @@ function Displays({ settings }: { settings: DaemonSettings }) {
     <>
       {x11 && (
         <Setting
+          label="Lock-screen wallpaper snapshot"
+          hint="Show a still frame of Penguin Engine's current wallpaper on Cinnamon's lock screen. Updates after wallpaper changes. Cinnamon's previous background is restored when disabled."
+        >
+          <Toggle on={settings.lockscreen_snapshot ?? false} onChange={(lockscreen_snapshot) => patch({ lockscreen_snapshot })} />
+        </Setting>
+      )}
+      {x11 && (
+        <Setting
           label="Span one wallpaper across all monitors"
           hint="Render one continuous wallpaper over the full X11 desktop instead of repeating it on each monitor. Works best for adjacent monitors. Your separate monitor assignments are retained."
         >

@@ -45,7 +45,7 @@ const props: Property[] = [
 
 const status: Status = {
   settings: {
-    fps: 60, audio: true, volume: 80, fill: "auto", layer: "background", passthrough: false, span: false, particles: 100,
+    fps: 60, audio: true, volume: 80, fill: "auto", layer: "background", passthrough: false, span: false, lockscreen_snapshot: false, particles: 100,
     rules: [
       { when: { if: "window", state: "fullscreen" }, playback: "pause" },
       { when: { if: "audio", app: "spotify" }, playback: "mute" },

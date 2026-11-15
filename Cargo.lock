@@ -6307,6 +6307,7 @@ dependencies = [
  "glam",
  "libpulse-binding",
  "pollster",
+ "png 0.18.1",
  "raw-window-handle",
  "sd-notify",
  "serde",

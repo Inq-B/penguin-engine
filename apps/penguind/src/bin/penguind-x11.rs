@@ -15,6 +15,8 @@ mod x11_windows;
 mod x11_rules;
 #[path = "../x11_sound_watch.rs"]
 mod x11_sound_watch;
+#[path = "../lockscreen.rs"]
+mod lockscreen;
 
 use std::collections::BTreeMap;
 use std::ffi::{c_char, c_int, c_long, c_ulong, c_void};
@@ -264,8 +266,9 @@ impl Screen {
             self.button(button,mask & bit != 0);
         }
     }
-    fn render(&mut self, gpu: &Gpu, fps_cap: u32, stats: bool) {
-        if self.paused || self.held.playback >= wpe_ipc::Playback::Pause { return; }
+    fn render(&mut self, gpu: &Gpu, fps_cap: u32, stats: bool,
+        capture: bool) -> Option<lockscreen::Capture> {
+        if self.paused || self.held.playback >= wpe_ipc::Playback::Pause { return None; }
         // The X11 loop uses 60 Hz when the general cap is unspecified.
         // Preserve a stricter per-output rule if one is active.
         let requested = if fps_cap == 0 { 60 } else { fps_cap };
@@ -275,22 +278,28 @@ impl Screen {
         // caused 60 Hz scenes to skip every other frame under ordinary render
         // load. Keep a small scheduling tolerance for per-output rule caps.
         let period=Duration::from_secs_f64(1.0 / cap as f64);
-        if self.last_render.elapsed().saturating_add(Duration::from_millis(2)) < period { return; }
-        let Some(wallpaper) = self.wallpaper.as_mut() else { return; };
+        if self.last_render.elapsed().saturating_add(Duration::from_millis(2)) < period { return None; }
+        let Some(wallpaper) = self.wallpaper.as_mut() else { return None; };
         let cpu_start=Instant::now();
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) |
             wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&gpu.device, &self.config); return;
+                self.surface.configure(&gpu.device, &self.config); return None;
             },
-            _ => return,
+            _ => return None,
         };
         let view = frame.texture.create_view(&Default::default());
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         wallpaper.set_scale(1.0);
         wallpaper.render(gpu, &mut encoder, &view, (self.config.width,self.config.height));
+        let mut snapshot=if capture && self.config.usage.contains(wgpu::TextureUsages::COPY_SRC) {
+            lockscreen::Capture::enqueue(gpu,&mut encoder,&frame.texture,self.config.format,
+                lockscreen::Rect {x:self.monitor.x,y:self.monitor.y,
+                    width:self.config.width,height:self.config.height})
+        } else {None};
         gpu.queue.submit([encoder.finish()]);
+        if let Some(snapshot)=&mut snapshot { snapshot.begin_mapping(); }
         gpu.queue.present(frame);
         let spent=cpu_start.elapsed();
         self.render_time+=spent;
@@ -312,6 +321,7 @@ impl Screen {
             self.frames=0;
             self.sampled=Instant::now();
         }
+        snapshot
     }
 }
 struct Peer { socket: UnixStream, buffer: Vec<u8> }
@@ -332,6 +342,12 @@ struct App {
     last_state_edit: Instant,
     hit_window: c_ulong,
     hit_is_desktop: bool,
+    lock_rx: std::sync::mpsc::Receiver<bool>,
+    lock_bg: Option<lockscreen::CinnamonBackground>,
+    lock_snapshot_ready: bool,
+    lock_capture_at: Instant,
+    lock_capture: Option<lockscreen::Batch>,
+    lock_save: Option<std::sync::mpsc::Receiver<std::result::Result<(),String>>>,
 }
 impl App {
     fn save(&self) {
@@ -524,6 +540,8 @@ impl App {
             }
         }
         if changed {
+            self.lock_snapshot_ready=false;
+            self.lock_capture_at=Instant::now()-Duration::from_secs(120);
             unsafe {XFlush(self.display.0);}
             self.publish();
         }
@@ -545,6 +563,8 @@ impl App {
         s.buttons(0);
         s.wallpaper = Some(wallpaper);
         s.path = Some(path);
+        self.lock_snapshot_ready=false;
+        self.lock_capture_at=Instant::now()-Duration::from_secs(120);
         s.item = Some(item);
         s.paused = false;
         s.held = wpe_ipc::Limits::default();
@@ -552,6 +572,15 @@ impl App {
     }
     fn settings_update(&mut self, settings: Settings) {
         let old_span=self.settings.span;
+        let old_lock=self.settings.lockscreen_snapshot;
+        if old_lock && !settings.lockscreen_snapshot {
+            if let Some(lock)=&mut self.lock_bg {lock.deactivate();}
+            self.lock_capture=None;
+            self.lock_snapshot_ready=false;
+        }
+        if !old_lock && settings.lockscreen_snapshot {
+            self.lock_capture_at=Instant::now()-Duration::from_secs(120);
+        }
         if settings.passthrough {
             // Release any held buttons before removing the input region.
             for screen in &mut self.screens { screen.buttons(0); }
@@ -788,6 +817,13 @@ fn create_screen(display:&Display,instance:&wgpu::Instance,gpu:Option<&Gpu>,m:Mo
     // throughput of frames that will never be presented.
     config.present_mode=wgpu::PresentMode::Fifo;
     config.desired_maximum_frame_latency=2;
+    // Swapchain readback, when supported, copies ONLY wallpaper pixels,
+    // never other application windows or the lock screen itself.
+    if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+        config.usage|=wgpu::TextureUsages::COPY_SRC;
+    } else {
+        tracing::warn!("{}: swapchain has no COPY_SRC support; lock-screen snapshot unavailable",m.name);
+    }
     surface.configure(&gpu.device,&config);
     Ok((Screen {
         monitor:m,win,surface,config,wallpaper:None,path:None,item:None,
@@ -837,11 +873,16 @@ fn main()->Result<()> {
     }
     let (sound_tx,sound_rx)=std::sync::mpsc::channel();
     x11_sound_watch::watch(sound_tx);
+    let lock_rx=lockscreen::watch_cinnamon();
+    let lock_bg=lockscreen::snapshot_path().as_deref()
+        .map(lockscreen::CinnamonBackground::new);
     let mut app=App{display,gpu:gpu.context("no selected X11 output")?,screens,assets,
         state:saved,state_path:path,settings,signals:wpe_ipc::Signals::default(),sound_rx,
         peers:vec![],subscribers:vec![],quit:false,
         state_dirty:false,last_state_edit:Instant::now(),
-        hit_window:0,hit_is_desktop:false};
+        hit_window:0,hit_is_desktop:false,lock_rx,lock_bg,
+        lock_snapshot_ready:false,lock_capture_at:Instant::now()-Duration::from_secs(120),
+        lock_capture:None,lock_save:None};
     for i in 0..app.screens.len() {
         let name=app.screens[i].monitor.name.clone();
         if let Some(saved)=app.state.for_output(&name).cloned() {
@@ -881,6 +922,45 @@ fn main()->Result<()> {
             app.state_dirty=false;
         }
         app.poll_input();
+        while let Ok(active)=app.lock_rx.try_recv() {
+            if active && app.settings.lockscreen_snapshot && app.lock_snapshot_ready {
+                if let (Some(bg),Some(path))=(&mut app.lock_bg,lockscreen::snapshot_path()) {
+                    if path.exists() { bg.activate(app.screens.len()>1 || app.settings.span); }
+                }
+            } else if !active {
+                if let Some(bg)=&mut app.lock_bg {bg.deactivate();}
+            }
+        }
+        if let Some(receiver)=&app.lock_save {
+            if let Ok(result)=receiver.try_recv() {
+                match result {
+                    Ok(())=>{app.lock_snapshot_ready=true;
+                        tracing::debug!("updated Cinnamon lock-screen snapshot");},
+                    Err(e)=>tracing::warn!("lock-screen snapshot: {e}"),
+                }
+                app.lock_save=None;
+            }
+        }
+        if app.lock_capture.is_some() {
+            let result=app.lock_capture.as_mut().unwrap().poll(&app.gpu);
+            match result {
+                Ok(Some(frames))=>{
+                    app.lock_capture=None;
+                    if let Some(path)=lockscreen::snapshot_path() {
+                        let (tx,rx)=std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _=tx.send(lockscreen::save_png(frames,&path));
+                        });
+                        app.lock_save=Some(rx);
+                    }
+                }
+                Ok(None)=>{},
+                Err(e)=>{
+                    tracing::warn!("lock-screen snapshot readback: {e}");
+                    app.lock_capture=None;
+                }
+            }
+        }
         if !app.settings.passthrough && last_buttons.elapsed()>=Duration::from_millis(5) {
             app.poll_desktop_buttons();
             last_buttons=Instant::now();
@@ -914,7 +994,13 @@ fn main()->Result<()> {
             // transitions as a fallback, but ONLY when the topmost window is
             // a desktop surface (never over an application).
             let desktop=pointer_ok && app.desktop_hit(child);
+            let capture_due=app.settings.lockscreen_snapshot
+                && app.lock_capture.is_none() && app.lock_save.is_none()
+                && app.lock_capture_at.elapsed()>=Duration::from_secs(90);
+            let mut snapshots=Vec::new();
+            let mut expected=0usize;
             for s in &mut app.screens {
+                if s.wallpaper.is_some() && !s.paused { expected+=1; }
                 let inside=pointer_ok
                     && rx>=s.monitor.x && ry>=s.monitor.y
                     && i64::from(rx)<i64::from(s.monitor.x)+i64::from(s.monitor.width)
@@ -928,7 +1014,20 @@ fn main()->Result<()> {
                 }
                 let buttons=if !app.settings.passthrough && desktop && inside { mask } else { 0 };
                 s.buttons(buttons);
-                s.render(&app.gpu,app.settings.fps,args.stats);
+                if let Some(capture)=s.render(&app.gpu,app.settings.fps,args.stats,capture_due) {
+                    snapshots.push(capture);
+                }
+            }
+            if capture_due && expected>0 {
+                if snapshots.len()==expected {
+                    app.lock_capture=Some(lockscreen::Batch::new(snapshots));
+                }
+                // Retry after a short delay if a screen was between frames.
+                app.lock_capture_at=if app.lock_capture.is_some() {
+                    Instant::now()
+                } else {
+                    Instant::now()-Duration::from_secs(85)
+                };
             }
             let cap=if app.settings.fps==0 {60}else{app.settings.fps.max(1)};
             let period=Duration::from_secs_f64(1.0/cap as f64);
@@ -944,6 +1043,7 @@ fn main()->Result<()> {
         std::thread::sleep(until.min(Duration::from_millis(5)));
     }
     if app.state_dirty { app.save(); }
+    if let Some(bg)=&mut app.lock_bg {bg.deactivate();}
     app.subscribers.clear();
     app.peers.clear();
     app.screens.clear();
