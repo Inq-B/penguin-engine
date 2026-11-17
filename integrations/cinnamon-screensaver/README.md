@@ -37,7 +37,7 @@ wallpaper. It may consume significant CPU when compressing large (e.g.,
 From the repository root, build the daemon with default features enabled:
 
 ```bash
-git switch feat/cinnamon-screensaver
+git fetch origin\ngit switch --track origin/feat/cinnamon-screensaver
 cargo install --path apps/penguind --bins --locked --force
 ```
 

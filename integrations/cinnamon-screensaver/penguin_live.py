@@ -63,7 +63,14 @@ class LiveWallpaper(Gtk.DrawingArea):
         x, y, width, height = self.rect
         # PNGs use the XRandR virtual desktop coordinates, while this widget
         # occupies an individual screen (or the single spanned stage).
-        Gdk.cairo_set_source_pixbuf(cr, self.pixbuf, -x, -y)
+        screen = Gdk.Screen.get_default()
+        if screen is not None:
+            n = screen.get_n_monitors()
+            origin_x = min((screen.get_monitor_geometry(i).x for i in range(n)), default=0)
+            origin_y = min((screen.get_monitor_geometry(i).y for i in range(n)), default=0)
+        else:
+            origin_x = origin_y = 0
+        Gdk.cairo_set_source_pixbuf(cr, self.pixbuf, origin_x - x, origin_y - y)
         cr.paint()
 
         # Match Cinnamon's existing MonitorView.shade_wallpaper callback.

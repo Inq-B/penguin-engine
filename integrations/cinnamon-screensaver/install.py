@@ -83,7 +83,9 @@ def install(folder: Path) -> None:
         candidate = Path(temp) / ORIGINAL_NAME
         candidate.write_text(updated, encoding="utf-8")
         py_compile.compile(str(candidate), doraise=True)
-        py_compile.compile(str(Path(__file__).with_name(MODULE_NAME)), doraise=True)
+        py_compile.compile(str(Path(__file__).with_name(MODULE_NAME)),
+                           cfile=str(Path(temp) / "penguin_live.pyc"),
+                           doraise=True)
 
     original_mode = target.stat().st_mode & 0o777
     shutil.copy2(target, backup)
