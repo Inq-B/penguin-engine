@@ -1,7 +1,7 @@
 name: X11 backend check
 on:
   push:
-    branches: [feat/x11-backend]
+    branches: [feat/x11-backend, feat/cinnamon-screensaver]
   workflow_dispatch:
 concurrency:
   group: x11-${{ github.ref }}
