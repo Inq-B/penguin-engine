@@ -133,6 +133,24 @@ pub fn snapshot_path(slot:u8)->Option<PathBuf>{
     Some(dirs::cache_dir()?.join("penguin-engine").join(format!("lockscreen-{}.png",
         if slot & 1 == 0 {"a"}else{"b"})))
 }
+/// Prime the shared-frame marker before the first lock so Cinnamon can
+/// construct its live background widget at Stage startup.
+pub fn prime_live_frame(snapshot:&Path)->Result<(),String>{
+    if !live_enabled(){return Ok(());}
+    let destination=live_path(0).ok_or("XDG_RUNTIME_DIR is missing")?;
+    if let Some(parent)=destination.parent(){
+        std::fs::create_dir_all(parent).map_err(|e|e.to_string())?;
+    }
+    let temp=destination.with_extension("png.tmp");
+    std::fs::copy(snapshot,&temp).map_err(|e|e.to_string())?;
+    std::fs::rename(temp,&destination).map_err(|e|e.to_string())?;
+    publish_live_frame(&destination)
+}
+pub fn clear_live_marker(){
+    if let Some(dir)=live_dir(){
+        let _=std::fs::remove_file(dir.join("lockscreen-live-current"));
+    }
+}
 fn get(schema:&str,key:&str)->Option<String>{
     let out=Command::new("gsettings").args(["get",schema,key]).output().ok()?;
     out.status.success().then(||String::from_utf8_lossy(&out.stdout).trim().to_owned())

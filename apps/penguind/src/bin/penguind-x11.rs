@@ -349,6 +349,7 @@ struct App {
     lock_capture: Option<lockscreen::Batch>,
     lock_save: Option<std::sync::mpsc::Receiver<std::result::Result<PathBuf,String>>>,
     lock_next_slot: u8,
+    lock_live_slot: u8,
     lock_is_locked: bool,
     lock_pending_path: Option<PathBuf>,
 }
@@ -543,6 +544,7 @@ impl App {
             }
         }
         if changed {
+            lockscreen::clear_live_marker();
             self.lock_snapshot_ready=false;
             self.lock_capture_at=Instant::now()-Duration::from_secs(120);
             unsafe {XFlush(self.display.0);}
@@ -579,6 +581,7 @@ impl App {
         if old_lock && !settings.lockscreen_snapshot {
             if let Some(lock)=&mut self.lock_bg {lock.deactivate();}
             self.lock_capture=None;
+            lockscreen::clear_live_marker();
             self.lock_pending_path=None;
             self.lock_snapshot_ready=false;
         }
@@ -882,6 +885,9 @@ fn main()->Result<()> {
     // Restore a stale override after an unclean exit if the setting was
     // disabled in the meantime. Otherwise retain the original backup.
     if !settings.lockscreen_snapshot { lock_bg.deactivate(); }
+    if !settings.lockscreen_snapshot || !lockscreen::live_enabled(){
+        lockscreen::clear_live_marker();
+    }
     let next_slot=lock_bg.next_slot();
     let lock_bg=Some(lock_bg);
     let mut app=App{display,gpu:gpu.context("no selected X11 output")?,screens,assets,
@@ -891,7 +897,7 @@ fn main()->Result<()> {
         hit_window:0,hit_is_desktop:false,lock_rx,lock_bg,
         lock_snapshot_ready:false,lock_capture_at:Instant::now()-Duration::from_secs(120),
         lock_capture:None,lock_save:None,lock_next_slot:next_slot,
-        lock_is_locked:false,lock_pending_path:None};
+        lock_live_slot:0,lock_is_locked:false,lock_pending_path:None};
     for i in 0..app.screens.len() {
         let name=app.screens[i].monitor.name.clone();
         if let Some(saved)=app.state.for_output(&name).cloned() {
@@ -939,6 +945,9 @@ fn main()->Result<()> {
         // restore it when the integration is disabled or the daemon exits.
         while let Ok(active)=app.lock_rx.try_recv() {
             app.lock_is_locked=active;
+            if active && app.settings.lockscreen_snapshot && lockscreen::live_enabled(){
+                app.lock_capture_at=Instant::now()-Duration::from_secs(120);
+            }
             if !active && app.settings.lockscreen_snapshot {
                 if let Some(path)=app.lock_pending_path.take() {
                     if let Some(bg)=&mut app.lock_bg {
@@ -951,17 +960,27 @@ fn main()->Result<()> {
             if let Ok(result)=receiver.try_recv() {
                 match result {
                     Ok(path)=>{
-                        app.lock_snapshot_ready=true;
-                        app.lock_next_slot^=1;
-                        if app.settings.lockscreen_snapshot {
-                            if app.lock_is_locked {
-                                // Don't swap wallpapers mid-lock.
-                                app.lock_pending_path=Some(path);
-                            } else if let Some(bg)=&mut app.lock_bg {
-                                bg.activate(&path,app.screens.len()>1 || app.settings.span);
+                        if lockscreen::is_live_frame(&path) {
+                            app.lock_live_slot^=1;
+                            if let Err(e)=lockscreen::publish_live_frame(&path) {
+                                tracing::warn!("publishing Cinnamon live frame: {e}");
+                            }
+                        } else {
+                            app.lock_snapshot_ready=true;
+                            app.lock_next_slot^=1;
+                            if let Err(e)=lockscreen::prime_live_frame(&path){
+                                tracing::warn!("priming Cinnamon live frames: {e}");
+                            }
+                            if app.settings.lockscreen_snapshot {
+                                if app.lock_is_locked {
+                                    // Don't swap background URIs while locked.
+                                    app.lock_pending_path=Some(path);
+                                } else if let Some(bg)=&mut app.lock_bg {
+                                    bg.activate(&path,app.screens.len()>1 || app.settings.span);
+                                }
                             }
                         }
-                        tracing::debug!("prepared Cinnamon lock-screen snapshot");
+                        tracing::debug!("prepared Cinnamon lock-screen frame");
                     },
                     Err(e)=>tracing::warn!("lock-screen snapshot: {e}"),
                 }
@@ -973,7 +992,14 @@ fn main()->Result<()> {
             match result {
                 Ok(Some(frames))=>{
                     app.lock_capture=None;
-                    if let Some(path)=lockscreen::snapshot_path(app.lock_next_slot) {
+                    let native=app.lock_is_locked && app.settings.lockscreen_snapshot
+                        && lockscreen::live_enabled();
+                    let path=if native {
+                        lockscreen::live_path(app.lock_live_slot)
+                    } else {
+                        lockscreen::snapshot_path(app.lock_next_slot)
+                    };
+                    if let Some(path)=path {
                         let (tx,rx)=std::sync::mpsc::channel();
                         std::thread::spawn(move || {
                             let result=lockscreen::save_png(frames,&path).map(|()|path);
@@ -1022,9 +1048,15 @@ fn main()->Result<()> {
             // transitions as a fallback, but ONLY when the topmost window is
             // a desktop surface (never over an application).
             let desktop=pointer_ok && app.desktop_hit(child);
+            let native=app.lock_is_locked && lockscreen::live_enabled();
+            let capture_period=if native {
+                Duration::from_millis(500)
+            }else{
+                Duration::from_secs(90)
+            };
             let capture_due=app.settings.lockscreen_snapshot
                 && app.lock_capture.is_none() && app.lock_save.is_none()
-                && app.lock_capture_at.elapsed()>=Duration::from_secs(90);
+                && app.lock_capture_at.elapsed()>=capture_period;
             let mut snapshots=Vec::new();
             let mut expected=0usize;
             for s in &mut app.screens {
@@ -1071,6 +1103,7 @@ fn main()->Result<()> {
         std::thread::sleep(until.min(Duration::from_millis(5)));
     }
     if app.state_dirty { app.save(); }
+    lockscreen::clear_live_marker();
     if let Some(bg)=&mut app.lock_bg {bg.deactivate();}
     app.subscribers.clear();
     app.peers.clear();
