@@ -133,6 +133,56 @@ pub fn snapshot_path(slot:u8)->Option<PathBuf>{
     Some(dirs::cache_dir()?.join("penguin-engine").join(format!("lockscreen-{}.png",
         if slot & 1 == 0 {"a"}else{"b"})))
 }
+/// The native Cinnamon adapter is opt-in; a marker exists in the user's
+/// configuration, not in Cinnamon's system-owned files.
+pub fn live_enabled() -> bool {
+    dirs::config_dir().is_some_and(|dir|
+        dir.join("penguin-engine")
+            .join("cinnamon-screensaver-live.enabled").is_file()
+    )
+}
+
+/// Live frames belong in user-owned runtime storage, not the shared cache.
+fn live_dir() -> Option<PathBuf> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
+    Some(PathBuf::from(runtime).join("penguin-engine"))
+}
+
+/// Always return an owned path; the capture worker passes it between threads.
+pub fn live_path(slot: u8) -> Option<PathBuf> {
+    let name = if slot & 1 == 0 {
+        "lockscreen-live-a.png"
+    } else {
+        "lockscreen-live-b.png"
+    };
+    Some(live_dir()?.join(name))
+}
+
+pub fn is_live_frame(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("lockscreen-live-a.png" | "lockscreen-live-b.png")
+    )
+}
+
+/// Publish the completed frame with an atomic marker update, so the
+/// screensaver never opens a partially written PNG.
+pub fn publish_live_frame(path: &Path) -> Result<(), String> {
+    if !is_live_frame(path) {
+        return Err("invalid live wallpaper frame name".into());
+    }
+    let dir = live_dir().ok_or("XDG_RUNTIME_DIR unavailable")?;
+    if path.parent() != Some(dir.as_path()) {
+        return Err("live frame must be inside XDG_RUNTIME_DIR/penguin-engine".into());
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let name = path.file_name().ok_or("invalid live frame name")?;
+    let tmp = dir.join("lockscreen-live-current.tmp");
+    let marker = dir.join("lockscreen-live-current");
+    std::fs::write(&tmp, name.as_encoded_bytes()).map_err(|e| e.to_string())?;
+    std::fs::rename(tmp, marker).map_err(|e| e.to_string())
+}
+
 /// Prime the shared-frame marker before the first lock so Cinnamon can
 /// construct its live background widget at Stage startup.
 pub fn prime_live_frame(snapshot:&Path)->Result<(),String>{
